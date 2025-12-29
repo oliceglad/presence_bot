@@ -1,0 +1,80 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: presence_postgres
+    env_file:
+      - .env
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U presence -d presence"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  migrations:
+    build: .
+    container_name: presence_migrations
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    command: ["alembic", "upgrade", "head"]
+
+  seed:
+    build: .
+    container_name: presence_seed
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    command: ["python", "-m", "app.seed"]
+
+  redis:
+    image: redis:7
+    container_name: presence_redis
+    ports:
+      - "6379:6379"
+
+  celery_worker:
+    build: .
+    container_name: presence_celery_worker
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    env_file:
+      - .env
+    command: ["celery", "-A", "app.celery_app.celery_app", "worker", "-l", "info", "--pool=solo", "-c", "1"]
+
+  celery_beat:
+    build: .
+    container_name: presence_celery_beat
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    env_file:
+      - .env
+    command: ["celery", "-A", "app.celery_app.celery_app", "beat", "-l", "info"]
+
+  bot:
+    build: .
+    container_name: presence_bot
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    restart: unless-stopped
+
+volumes:
+  pgdata:
