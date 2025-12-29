@@ -1,7 +1,15 @@
 from celery import Celery
 from celery.schedules import crontab
 
-from app.config import REDIS_URL, TIMEZONE, SEND_HOUR, SEND_MINUTE, ENABLE_SCHEDULES
+from app.config import (
+    REDIS_URL,
+    TIMEZONE,
+    SEND_HOUR,
+    SEND_MINUTE,
+    REMINDER_HOUR,
+    REMINDER_MINUTE,
+    ENABLE_SCHEDULES,
+)
 
 celery_app = Celery(
     "presence_bot",
@@ -19,5 +27,9 @@ if ENABLE_SCHEDULES:
         "send-daily": {
             "task": "app.tasks.send_daily_task",
             "schedule": crontab(hour=SEND_HOUR, minute=SEND_MINUTE),
+        },
+        "send-reminders": {
+            "task": "app.tasks.send_reminders_task",
+            "schedule": crontab(hour=REMINDER_HOUR, minute=REMINDER_MINUTE),
         },
     }

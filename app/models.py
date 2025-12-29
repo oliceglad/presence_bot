@@ -12,6 +12,10 @@ class User(Base):
     tg_user_id = Column(BigInteger, unique=True, nullable=False)
     tg_chat_id = Column(BigInteger, nullable=False)
     consent = Column(Boolean, default=False)
+    snooze_until = Column(DateTime, nullable=True)
+    last_activity_at = Column(DateTime, nullable=True)
+    last_inactivity_reminder_at = Column(DateTime, nullable=True)
+    last_expiry_reminder_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
 
 
@@ -39,6 +43,9 @@ class InboxMessage(Base):
     text = Column(Text, nullable=True)
     media_type = Column(String, nullable=True)
     media_file_id = Column(String, nullable=True)
+    action_rule_id = Column(Integer, ForeignKey("action_rules.id"), nullable=True)
+    action_status = Column(String, nullable=True)
+    action_reviewed_at = Column(DateTime, nullable=True)
     raw = Column(Text)
     created_at = Column(DateTime, server_default=func.now())
 

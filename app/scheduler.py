@@ -10,7 +10,12 @@ from aiogram.exceptions import (
 )
 
 from app.db import AsyncSessionLocal
-from app.models import ScheduleMessage, User
+from app.models import ScheduleMessage, User, Subscription
+from app.config import (
+    REMINDER_EXPIRES_IN_DAYS,
+    REMINDER_INACTIVITY_DAYS,
+    REMINDER_COOLDOWN_HOURS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -196,5 +201,90 @@ async def send_outbox(
                     "send_outbox: no deliveries schedule_id=%s",
                     msg.id
                 )
+
+        await session.commit()
+
+
+async def send_reminders(bot, session_factory=AsyncSessionLocal):
+    """
+    Отправляет напоминания о скором окончании подписки и бездействии.
+    """
+    now = datetime.utcnow()
+    cooldown = timedelta(hours=REMINDER_COOLDOWN_HOURS)
+
+    async with session_factory() as session:
+        users = (await session.scalars(
+            select(User).where(User.consent.is_(True)).order_by(User.id)
+        )).all()
+
+        if not users:
+            logger.debug("send_reminders: no consenting users")
+            return
+
+        for user in users:
+            if user.snooze_until and user.snooze_until > now:
+                continue
+
+            sub = await session.scalar(
+                select(Subscription).where(Subscription.user_id == user.id)
+            )
+
+            lines = []
+            update_expiry = False
+            update_inactivity = False
+
+            if sub and sub.expires_at:
+                days_left = (sub.expires_at.date() - now.date()).days
+                needs_expiry = days_left <= REMINDER_EXPIRES_IN_DAYS
+                can_send_expiry = (
+                    not user.last_expiry_reminder_at
+                    or now - user.last_expiry_reminder_at >= cooldown
+                )
+                if needs_expiry and can_send_expiry:
+                    if days_left < 0:
+                        lines.append("Подписка закончилась. Пришли доказательство, чтобы продлить.")
+                    elif days_left == 0:
+                        lines.append("Подписка заканчивается сегодня. Пришли доказательство, чтобы продлить.")
+                    elif days_left == 1:
+                        lines.append("Подписка заканчивается завтра. Пришли доказательство, чтобы продлить.")
+                    else:
+                        lines.append(
+                            f"Подписка заканчивается через {days_left} дн. Пришли доказательство, чтобы продлить."
+                        )
+                    update_expiry = True
+
+            last_activity = user.last_activity_at or user.created_at
+            if last_activity:
+                inactive_days = (now.date() - last_activity.date()).days
+                needs_inactive = inactive_days >= REMINDER_INACTIVITY_DAYS
+                can_send_inactive = (
+                    not user.last_inactivity_reminder_at
+                    or now - user.last_inactivity_reminder_at >= cooldown
+                )
+                if needs_inactive and can_send_inactive:
+                    lines.append(
+                        f"Мы давно не виделись ({inactive_days} дн.). Напиши пару слов или пришли доказательство."
+                    )
+                    update_inactivity = True
+
+            if not lines:
+                continue
+
+            try:
+                await bot.send_message(user.tg_chat_id, "\n".join(lines))
+            except TelegramForbiddenError:
+                logger.warning("send_reminders: user blocked bot user_id=%s", user.id)
+                continue
+            except TelegramNetworkError as exc:
+                logger.warning("send_reminders: network error user_id=%s err=%s", user.id, exc)
+                continue
+            except Exception:
+                logger.exception("send_reminders: unexpected error user_id=%s", user.id)
+                continue
+
+            if update_expiry:
+                user.last_expiry_reminder_at = now
+            if update_inactivity:
+                user.last_inactivity_reminder_at = now
 
         await session.commit()

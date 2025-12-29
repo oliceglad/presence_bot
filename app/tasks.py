@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
 from app.celery_app import celery_app
 from app.config import BOT_TOKEN, DATABASE_URL, ADMIN_TG_ID
-from app.scheduler import send_daily, send_outbox
+from app.scheduler import send_daily, send_outbox, send_reminders
 from app.models import User, ScheduleMessage
 
 logger = logging.getLogger(__name__)
@@ -40,6 +40,11 @@ def send_daily_task():
 @celery_app.task(name="app.tasks.send_outbox_task")
 def send_outbox_task():
     asyncio.run(_run_with_bot_and_db(send_outbox))
+
+
+@celery_app.task(name="app.tasks.send_reminders_task")
+def send_reminders_task():
+    asyncio.run(_run_with_bot_and_db(send_reminders))
 
 
 async def send_random(bot, session_factory):

@@ -27,6 +27,7 @@ from app.config import (
     SEND_HOUR,
     SEND_MINUTE,
     TIMEZONE,
+    REMINDER_SNOOZE_DEFAULT_DAYS,
 )
 from app.tasks import send_random_task
 
@@ -63,19 +64,18 @@ def user_menu_inline_keyboard():
         ]
     )
 
-def approve_keyboard(inbox_id: int):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Док-ва присланы", callback_data=f"approve:{inbox_id}")]
-        ]
-    )
-
-def approve_action_keyboard(inbox_id: int):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Подтвердить", callback_data=f"approve_action:confirm:{inbox_id}")]
-        ]
-    )
+def action_rules_keyboard(rules, inbox_id: int, prefix: str, include_deny: bool = False):
+    rows = []
+    for rule in rules:
+        label = f"{rule.title} (+{rule.days_to_extend} дн.)"
+        if prefix == "action_admin":
+            callback_data = f"{prefix}:approve:{rule.id}:{inbox_id}"
+        else:
+            callback_data = f"{prefix}:{rule.id}:{inbox_id}"
+        rows.append([InlineKeyboardButton(text=label, callback_data=callback_data)])
+    if include_deny:
+        rows.append([InlineKeyboardButton(text="Отклонить", callback_data=f"{prefix}:deny:{inbox_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 async def clear_inline_keyboard(message: Message):
     try:
@@ -97,6 +97,13 @@ def extract_media(message: Message):
 
 def has_proof_media(message: Message) -> bool:
     return bool(message.photo or message.video or message.video_note)
+
+async def get_active_rules(session):
+    return (await session.scalars(
+        select(ActionRule)
+        .where(ActionRule.active.is_(True))
+        .order_by(ActionRule.id)
+    )).all()
 
 @router.message(F.text == "/start")
 async def start(message: Message):
@@ -197,6 +204,7 @@ async def rules(message: Message):
         lines.append(f"- {rule.title}: +{rule.days_to_extend} дн.")
     lines.append(PROOF_HINT)
     lines.append("Как продлить: отправь фото/кружок/видео, админ подтвердит действие.")
+    lines.append("После отправки выбери действие из списка.")
     lines.append("Задания:")
     for task in TASKS:
         lines.append(f"- {task}")
@@ -221,7 +229,7 @@ async def help_command(message: Message):
             "/schedule_all — все 365 сообщений\n"
             "/outbox — сообщение на завтра\n"
             "/admin — меню админа\n"
-            "Проверка доказательств: кнопка «Док-ва присланы» под медиа"
+            "Проверка доказательств: выбери действие или «Отклонить» под медиа"
         )
     else:
         await message.answer(
@@ -230,6 +238,7 @@ async def help_command(message: Message):
             "- продлевает подписку за действия\n"
             "- показывает правила: /rules\n"
             "- показывает статус подписки: /my_status\n"
+            "- пауза напоминаний: /snooze 7, вернуть: /unsnooze\n"
             "Как продлить: отправь фото/кружок/видео, админ подтвердит действие.\n"
             "Открыть меню: /menu"
         )
@@ -253,13 +262,58 @@ async def get_user_status_text(tg_user_id: int) -> str:
             select(Subscription).where(Subscription.user_id == user.id)
         )
     expires = sub.expires_at.strftime("%Y-%m-%d %H:%M") if sub and sub.expires_at else "нет"
-    return f"Подписка активна до: {expires}"
+    lines = [f"Подписка активна до: {expires}"]
+    if user.snooze_until and user.snooze_until > datetime.utcnow():
+        lines.append(f"Напоминания на паузе до: {user.snooze_until.strftime('%Y-%m-%d')}")
+    return "\n".join(lines)
 
 
 @router.message(F.text == "/my_status")
 async def my_status(message: Message):
     text = await get_user_status_text(message.from_user.id)
     await message.answer(text)
+
+@router.message(F.text.startswith("/snooze"))
+async def snooze(message: Message):
+    parts = (message.text or "").split(maxsplit=1)
+    days = REMINDER_SNOOZE_DEFAULT_DAYS
+    if len(parts) > 1:
+        try:
+            days = int(parts[1])
+            if days <= 0:
+                raise ValueError
+        except ValueError:
+            await message.answer("Укажи число дней, например: /snooze 7")
+            return
+
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(
+            select(User).where(User.tg_user_id == message.from_user.id)
+        )
+        if not user or not user.consent:
+            await message.answer("Сначала /start.")
+            return
+        snooze_until = datetime.utcnow() + timedelta(days=days)
+        user.snooze_until = snooze_until
+        await session.commit()
+
+    until_txt = snooze_until.strftime("%Y-%m-%d")
+    await message.answer(f"Ок, напоминания на паузе до {until_txt}.")
+
+
+@router.message(F.text == "/unsnooze")
+async def unsnooze(message: Message):
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(
+            select(User).where(User.tg_user_id == message.from_user.id)
+        )
+        if not user or not user.consent:
+            await message.answer("Сначала /start.")
+            return
+        user.snooze_until = None
+        await session.commit()
+
+    await message.answer("Напоминания снова активны.")
 
 async def send_random_to_users(bot, chat_id: int):
     if USE_CELERY:
@@ -486,50 +540,64 @@ async def inbox(message: Message):
 
         text = extract_text(message)
         media_type, media_file_id = extract_media(message)
+        has_proof = has_proof_media(message)
+        now = datetime.utcnow()
         inbox = InboxMessage(
             user_id=user.id,
             tg_message_id=message.message_id,
             text=text,
             media_type=media_type,
             media_file_id=media_file_id,
+            action_status="pending" if has_proof else None,
             raw=message.model_dump_json()
         )
         session.add(inbox)
+        user.last_activity_at = now
 
-        has_proof = has_proof_media(message)
+        rules = []
+        if has_proof:
+            rules = await get_active_rules(session)
 
+        await session.flush()
         await session.commit()
 
-    # уведомляем админа и даем кнопку подтверждения
+    # уведомляем админа и даем кнопки выбора правила
     if has_proof:
-        caption = f"Доказательство:\n{text}\n\nНажми «Док-ва присланы» для подтверждения.".strip()
+        caption = f"Доказательство:\n{text}\n\nВыбери действие или отклони.".strip()
+        admin_keyboard = action_rules_keyboard(rules, inbox.id, "action_admin", include_deny=True)
         if media_type == "photo":
             await message.bot.send_photo(
                 ADMIN_TG_ID,
                 media_file_id,
                 caption=caption,
-                reply_markup=approve_keyboard(inbox.id)
+                reply_markup=admin_keyboard
             )
         elif media_type == "video":
             await message.bot.send_video(
                 ADMIN_TG_ID,
                 media_file_id,
                 caption=caption,
-                reply_markup=approve_keyboard(inbox.id)
+                reply_markup=admin_keyboard
             )
         elif media_type == "video_note":
             await message.bot.send_video_note(
                 ADMIN_TG_ID,
                 media_file_id,
-                reply_markup=approve_keyboard(inbox.id)
+                reply_markup=admin_keyboard
             )
         else:
             await message.bot.send_message(
                 ADMIN_TG_ID,
                 caption,
-                reply_markup=approve_keyboard(inbox.id)
+                reply_markup=admin_keyboard
             )
-        await message.answer("Спасибо! Я передал доказательства на проверку.")
+        if rules:
+            await message.answer(
+                "Спасибо! Выбери действие для этого доказательства:",
+                reply_markup=action_rules_keyboard(rules, inbox.id, "action_user")
+            )
+        else:
+            await message.answer("Спасибо! Я передал доказательства на проверку.")
     else:
         await message.bot.send_message(
             ADMIN_TG_ID,
@@ -537,53 +605,22 @@ async def inbox(message: Message):
         )
 
 
-@router.callback_query(F.data.startswith("approve:"))
-async def approve_callback(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_TG_ID:
-        await callback.answer("Недоступно.")
-        return
-
-    parts = callback.data.split(":")
-    if len(parts) != 2:
-        await callback.answer("Ошибка данных.")
-        return
-    _, inbox_id = parts
-    try:
-        inbox_id = int(inbox_id)
-    except ValueError:
-        await callback.answer("Ошибка данных.")
-        return
-
+async def apply_action_for_inbox(inbox_id: int, rule_id: int):
     async with AsyncSessionLocal() as session:
         inbox = await session.get(InboxMessage, inbox_id)
         if not inbox or inbox.user_id is None:
-            await callback.answer("Сообщение не найдено.")
-            return
-        if not inbox.media_file_id:
-            await callback.answer("Нет медиа.")
-            return
+            return None, None, None, None
 
-    await callback.message.edit_reply_markup(reply_markup=approve_action_keyboard(inbox_id))
-    await callback.answer("Подтвердите действие.")
-
-
-async def apply_action_for_inbox(inbox_id: int, action_key: str, task_name: str | None = None):
-    async with AsyncSessionLocal() as session:
-        inbox = await session.get(InboxMessage, inbox_id)
-        if not inbox or inbox.user_id is None:
-            return None, None, None
+        if inbox.action_status in ("approved", "denied"):
+            return "already", None, None, None
 
         user = await session.scalar(select(User).where(User.id == inbox.user_id))
         if not user:
-            return None, None, None
+            return None, None, None, None
 
-        rule = await session.scalar(
-            select(ActionRule)
-            .where(ActionRule.key == action_key)
-            .where(ActionRule.active.is_(True))
-        )
-        if not rule:
-            return None, None, None
+        rule = await session.get(ActionRule, rule_id)
+        if not rule or not rule.active:
+            return None, None, None, None
 
         now = datetime.utcnow()
         sub = await session.scalar(
@@ -600,8 +637,8 @@ async def apply_action_for_inbox(inbox_id: int, action_key: str, task_name: str 
         sub.expires_at = new_expires
 
         raw = inbox.text or ""
-        if task_name:
-            raw = f"{task_name}; {raw}".strip("; ").strip()
+        if rule.title:
+            raw = f"{rule.title}; {raw}".strip("; ").strip()
 
         session.add(ActionEvent(
             user_id=user.id,
@@ -610,46 +647,156 @@ async def apply_action_for_inbox(inbox_id: int, action_key: str, task_name: str 
             old_expires_at=old_expires,
             new_expires_at=new_expires
         ))
+        inbox.action_rule_id = rule.id
+        inbox.action_status = "approved"
+        inbox.action_reviewed_at = now
         await session.commit()
 
-        return old_expires, new_expires, user.tg_chat_id
+        return old_expires, new_expires, user.tg_chat_id, rule.title
 
 
-@router.callback_query(F.data.startswith("approve_action:"))
-async def approve_action_callback(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_TG_ID:
-        await callback.answer("Недоступно.")
-        return
+async def deny_action_for_inbox(inbox_id: int):
+    async with AsyncSessionLocal() as session:
+        inbox = await session.get(InboxMessage, inbox_id)
+        if not inbox or inbox.user_id is None:
+            return None, None
 
+        if inbox.action_status in ("approved", "denied"):
+            return "already", None
+
+        user = await session.scalar(select(User).where(User.id == inbox.user_id))
+        if not user:
+            return None, None
+
+        inbox.action_status = "denied"
+        inbox.action_reviewed_at = datetime.utcnow()
+        await session.commit()
+
+        return user.tg_chat_id, user.tg_user_id
+
+
+@router.callback_query(F.data.startswith("action_user:"))
+async def action_user_callback(callback: CallbackQuery):
     parts = callback.data.split(":")
     if len(parts) != 3:
         await callback.answer("Ошибка данных.")
         return
-    _, action_key, inbox_id = parts
+
+    _, rule_id, inbox_id = parts
     try:
+        rule_id = int(rule_id)
         inbox_id = int(inbox_id)
     except ValueError:
         await callback.answer("Ошибка данных.")
         return
 
-    if action_key != "confirm":
-        await callback.answer("Неверное действие.")
-        return
+    async with AsyncSessionLocal() as session:
+        inbox = await session.get(InboxMessage, inbox_id)
+        if not inbox or inbox.user_id is None:
+            await callback.answer("Сообщение не найдено.")
+            return
+        if inbox.action_status in ("approved", "denied"):
+            await callback.answer("Уже обработано.")
+            await clear_inline_keyboard(callback.message)
+            return
 
-    old_expires, new_expires, user_chat_id = await apply_action_for_inbox(inbox_id, "task")
-    if not new_expires:
-        await callback.answer("Не удалось применить действие.")
-        return
+        user = await session.scalar(select(User).where(User.id == inbox.user_id))
+        if not user or user.tg_user_id != callback.from_user.id:
+            await callback.answer("Недоступно.")
+            return
+
+        rule = await session.get(ActionRule, rule_id)
+        if not rule or not rule.active:
+            await callback.answer("Правило недоступно.")
+            return
+
+        rule_title = rule.title
+        inbox.action_rule_id = rule.id
+        if not inbox.action_status:
+            inbox.action_status = "pending"
+        await session.commit()
 
     await clear_inline_keyboard(callback.message)
-    await callback.answer("Продлено.")
-    new_txt = new_expires.strftime("%Y-%m-%d %H:%M")
-    await callback.message.answer(f"Подписка продлена до {new_txt}.")
-    if user_chat_id:
-        await callback.message.bot.send_message(
-            user_chat_id,
-            f"Подписка продлена до {new_txt}. Спасибо за действие!"
-        )
+    await callback.answer("Выбрано.")
+    await callback.message.answer(f"Действие выбрано: {rule_title}.")
+    await callback.message.bot.send_message(
+        ADMIN_TG_ID,
+        f"Пользователь выбрал действие: {rule_title} (доказательство #{inbox_id})."
+    )
+
+
+@router.callback_query(F.data.startswith("action_admin:"))
+async def action_admin_callback(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_TG_ID:
+        await callback.answer("Недоступно.")
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) < 3:
+        await callback.answer("Ошибка данных.")
+        return
+
+    action = parts[1]
+    if action == "approve":
+        if len(parts) != 4:
+            await callback.answer("Ошибка данных.")
+            return
+        _, _, rule_id, inbox_id = parts
+        try:
+            rule_id = int(rule_id)
+            inbox_id = int(inbox_id)
+        except ValueError:
+            await callback.answer("Ошибка данных.")
+            return
+
+        result = await apply_action_for_inbox(inbox_id, rule_id)
+        if result[0] == "already":
+            await callback.answer("Уже обработано.")
+            await clear_inline_keyboard(callback.message)
+            return
+
+        _, new_expires, user_chat_id, rule_title = result
+        if not new_expires:
+            await callback.answer("Не удалось применить действие.")
+            return
+
+        await clear_inline_keyboard(callback.message)
+        await callback.answer("Продлено.")
+        new_txt = new_expires.strftime("%Y-%m-%d %H:%M")
+        await callback.message.answer(f"Подписка продлена до {new_txt}.")
+        if user_chat_id:
+            await callback.message.bot.send_message(
+                user_chat_id,
+                f"Подписка продлена до {new_txt}. Спасибо за действие: {rule_title}!"
+            )
+    elif action == "deny":
+        if len(parts) != 3:
+            await callback.answer("Ошибка данных.")
+            return
+        _, _, inbox_id = parts
+        try:
+            inbox_id = int(inbox_id)
+        except ValueError:
+            await callback.answer("Ошибка данных.")
+            return
+
+        user_chat_id, user_tg_id = await deny_action_for_inbox(inbox_id)
+        if user_chat_id == "already":
+            await callback.answer("Уже обработано.")
+            await clear_inline_keyboard(callback.message)
+            return
+
+        await clear_inline_keyboard(callback.message)
+        await callback.answer("Отклонено.")
+        await callback.message.answer("Доказательство отклонено.")
+        if user_chat_id:
+            await callback.message.bot.send_message(
+                user_chat_id,
+                "Доказательство отклонено. Если есть ошибка, пришли еще раз."
+            )
+    else:
+        await callback.answer("Неизвестно.")
+        return
 
 
 
