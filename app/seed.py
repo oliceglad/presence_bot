@@ -1,6 +1,8 @@
+import argparse
 import asyncio
 import csv
 from datetime import datetime
+from pathlib import Path
 
 from sqlalchemy import select
 
@@ -8,22 +10,63 @@ from app.db import AsyncSessionLocal
 from app.models import ScheduleMessage, ActionRule
 
 
-async def import_csv():
+def resolve_csv_path(path: str | None) -> Path:
+    candidates = []
+    if path:
+        candidates.append(Path(path))
+    candidates.extend([
+        Path("messages_365.csv"),
+        Path("app/messages_365.csv"),
+    ])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError("messages_365.csv not found")
+
+
+def read_csv_rows(csv_path: Path):
+    with csv_path.open(encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            yield row
+
+
+async def import_csv_if_empty(csv_path: Path):
     async with AsyncSessionLocal() as session:
         exists = await session.scalar(select(ScheduleMessage))
         if exists:
             return
 
-        with open("messages_365.csv", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
+        for row in read_csv_rows(csv_path):
+            session.add(ScheduleMessage(
+                day_index=int(row["day_index"]),
+                send_date=datetime.fromisoformat(row["date"]).date(),
+                type=row["type"],
+                text=row["text"]
+            ))
+        await session.commit()
+
+
+async def upsert_csv(csv_path: Path):
+    async with AsyncSessionLocal() as session:
+        for row in read_csv_rows(csv_path):
+            day_index = int(row["day_index"])
+            send_date = datetime.fromisoformat(row["date"]).date()
+            msg = await session.scalar(
+                select(ScheduleMessage).where(ScheduleMessage.day_index == day_index)
+            )
+            if msg:
+                msg.send_date = send_date
+                msg.type = row["type"]
+                msg.text = row["text"]
+            else:
                 session.add(ScheduleMessage(
-                    day_index=int(row["day_index"]),
-                    send_date=datetime.fromisoformat(row["date"]).date(),
+                    day_index=day_index,
+                    send_date=send_date,
                     type=row["type"],
                     text=row["text"]
                 ))
-            await session.commit()
+        await session.commit()
 
 
 async def ensure_action_rules():
@@ -50,7 +93,25 @@ async def ensure_action_rules():
 
 
 async def main():
-    await import_csv()
+    parser = argparse.ArgumentParser(description="Seed and sync schedule messages.")
+    parser.add_argument(
+        "--csv",
+        default=None,
+        help="Path to messages_365.csv (default: messages_365.csv or app/messages_365.csv)",
+    )
+    parser.add_argument(
+        "--update-csv",
+        action="store_true",
+        help="Update existing schedule_messages from CSV (upsert by day_index).",
+    )
+    args = parser.parse_args()
+
+    csv_path = resolve_csv_path(args.csv)
+
+    if args.update_csv:
+        await upsert_csv(csv_path)
+    else:
+        await import_csv_if_empty(csv_path)
     await ensure_action_rules()
 
 

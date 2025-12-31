@@ -32,6 +32,7 @@ from app.config import (
 from app.tasks import send_random_task
 
 router = Router()
+ADMIN_PENDING_TOMORROW = set()
 
 TASKS = [
     "10 минут прогулки",
@@ -51,6 +52,7 @@ def admin_menu_keyboard():
             [InlineKeyboardButton(text="Все 365 сообщений", callback_data="admin:schedule")],
             [InlineKeyboardButton(text="Доказательства", callback_data="admin:proofs")],
             [InlineKeyboardButton(text="Сообщение на завтра", callback_data="admin:next")],
+            [InlineKeyboardButton(text="Изменить сообщение на завтра", callback_data="admin:edit_next")],
             [InlineKeyboardButton(text="Случайное сообщение", callback_data="admin:random")],
         ]
     )
@@ -228,6 +230,7 @@ async def help_command(message: Message):
             "/send_random — отправить случайное сообщение\n"
             "/schedule_all — все 365 сообщений\n"
             "/outbox — сообщение на завтра\n"
+            "/set_tomorrow — изменить сообщение на завтра\n"
             "/admin — меню админа\n"
             "Проверка доказательств: выбери действие или «Отклонить» под медиа"
         )
@@ -471,6 +474,34 @@ async def send_admin_next_message(bot, chat_id: int):
         f"Сообщение на завтра ({tomorrow} в {time_txt}):\n{msg.text}"
     )
 
+async def update_admin_tomorrow_message(text: str):
+    async with AsyncSessionLocal() as session:
+        tomorrow = datetime.now().date() + timedelta(days=1)
+        msg = await session.scalar(
+            select(ScheduleMessage)
+            .where(ScheduleMessage.send_date == tomorrow)
+        )
+        if msg:
+            msg.text = text
+            msg.type = msg.type or "manual"
+            msg.sent_at = None
+            msg.send_at = None
+            msg.attempts = 0
+            msg.last_attempt_at = None
+            msg.last_error = None
+        else:
+            max_day_index = await session.scalar(
+                select(func.max(ScheduleMessage.day_index))
+            )
+            session.add(ScheduleMessage(
+                day_index=(max_day_index or 0) + 1,
+                send_date=tomorrow,
+                type="manual",
+                text=text
+            ))
+        await session.commit()
+        return tomorrow
+
 @router.message(F.text == "/status")
 async def status(message: Message):
     if message.from_user.id != ADMIN_TG_ID:
@@ -517,6 +548,23 @@ async def outbox(message: Message):
         return
     await send_admin_next_message(message.bot, message.chat.id)
 
+@router.message(F.text == "/set_tomorrow")
+async def set_tomorrow(message: Message):
+    if message.from_user.id != ADMIN_TG_ID:
+        return
+    ADMIN_PENDING_TOMORROW.add(message.from_user.id)
+    await message.answer("Пришли новый текст для завтрашнего сообщения. Отмена: /cancel_tomorrow")
+
+@router.message(F.text == "/cancel_tomorrow")
+async def cancel_tomorrow(message: Message):
+    if message.from_user.id != ADMIN_TG_ID:
+        return
+    if message.from_user.id in ADMIN_PENDING_TOMORROW:
+        ADMIN_PENDING_TOMORROW.discard(message.from_user.id)
+        await message.answer("Отменено.")
+    else:
+        await message.answer("Нет активного редактирования.")
+
 @router.message(F.text == "/schedule_all")
 async def schedule_all(message: Message):
     if message.from_user.id != ADMIN_TG_ID:
@@ -531,6 +579,16 @@ async def send_random(message: Message):
 
 @router.message()
 async def inbox(message: Message):
+    if message.from_user.id == ADMIN_TG_ID and message.from_user.id in ADMIN_PENDING_TOMORROW:
+        text = extract_text(message).strip()
+        if not text:
+            await message.answer("Нужен текст. Отмена: /cancel_tomorrow")
+            return
+        ADMIN_PENDING_TOMORROW.discard(message.from_user.id)
+        tomorrow = await update_admin_tomorrow_message(text)
+        await message.answer(f"Обновил сообщение на завтра ({tomorrow}).")
+        return
+
     async with AsyncSessionLocal() as session:
         user = await session.scalar(
             select(User).where(User.tg_user_id == message.from_user.id)
@@ -824,6 +882,9 @@ async def admin_menu_callback(callback: CallbackQuery):
         await send_admin_proofs(callback.message.bot, callback.message.chat.id)
     elif action in ("next", "outbox"):
         await send_admin_next_message(callback.message.bot, callback.message.chat.id)
+    elif action == "edit_next":
+        ADMIN_PENDING_TOMORROW.add(callback.from_user.id)
+        await callback.message.answer("Пришли новый текст для завтрашнего сообщения. Отмена: /cancel_tomorrow")
     elif action == "schedule":
         await send_admin_schedule(callback.message.bot, callback.message.chat.id)
     elif action == "reset":
