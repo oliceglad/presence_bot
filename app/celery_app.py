@@ -21,6 +21,12 @@ celery_app = Celery(
 celery_app.conf.timezone = TIMEZONE
 celery_app.conf.enable_utc = False
 celery_app.conf.broker_connection_retry_on_startup = True
+celery_app.conf.worker_prefetch_multiplier = 1
+celery_app.conf.task_acks_late = True
+celery_app.conf.task_reject_on_worker_lost = True
+celery_app.conf.broker_transport_options = {
+    "visibility_timeout": 3600,
+}
 celery_app.conf.beat_schedule = {}
 if ENABLE_SCHEDULES:
     celery_app.conf.beat_schedule = {

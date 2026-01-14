@@ -4,10 +4,11 @@ from aiogram import Bot
 import logging
 
 from sqlalchemy import select, func
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.celery_app import celery_app
-from app.config import BOT_TOKEN, DATABASE_URL, ADMIN_TG_ID
+from app.config import BOT_TOKEN, ADMIN_TG_ID
+from app.db import make_engine
 from app.scheduler import send_daily, send_outbox, send_reminders
 from app.models import User, ScheduleMessage
 
@@ -22,7 +23,7 @@ async def _run_with_bot(coro):
         await bot.session.close()
 
 async def _run_with_bot_and_db(coro):
-    engine = create_async_engine(DATABASE_URL, echo=False)
+    engine = make_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     bot = Bot(BOT_TOKEN)
     try:
