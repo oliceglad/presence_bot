@@ -11,6 +11,7 @@ from aiogram.types import (
 )
 from aiogram.exceptions import TelegramNetworkError
 from sqlalchemy import select, desc, func
+from pytz import timezone as pytz_timezone
 from app.db import AsyncSessionLocal
 from app.models import (
     User,
@@ -28,11 +29,18 @@ from app.config import (
     SEND_MINUTE,
     TIMEZONE,
     REMINDER_SNOOZE_DEFAULT_DAYS,
+    REMINDER_HOUR,
+    REMINDER_MINUTE,
+    ENABLE_SCHEDULES,
 )
 from app.tasks import send_random_task
+from app.scheduler import send_daily
 
 router = Router()
 ADMIN_PENDING_TOMORROW = set()
+ADMIN_PENDING_COMPLIMENT = set()
+COMPLIMENT_PAGE_SIZE = 10
+COMPLIMENT_BUTTON_MAX = 48
 
 TASKS = [
     "10 минут прогулки",
@@ -54,6 +62,10 @@ def admin_menu_keyboard():
             [InlineKeyboardButton(text="Сообщение на завтра", callback_data="admin:next")],
             [InlineKeyboardButton(text="Изменить сообщение на завтра", callback_data="admin:edit_next")],
             [InlineKeyboardButton(text="Случайное сообщение", callback_data="admin:random")],
+            [InlineKeyboardButton(text="Выбрать комплимент", callback_data="admin:compliment")],
+            [InlineKeyboardButton(text="Отправить сегодня", callback_data="admin:send_daily")],
+            [InlineKeyboardButton(text="Статус расписания", callback_data="admin:schedule_status")],
+            [InlineKeyboardButton(text="Комплимент по номеру", callback_data="admin:compliment_by_number")],
         ]
     )
 
@@ -99,6 +111,37 @@ def extract_media(message: Message):
 
 def has_proof_media(message: Message) -> bool:
     return bool(message.photo or message.video or message.video_note)
+
+def shorten_text(text: str, max_len: int = COMPLIMENT_BUTTON_MAX) -> str:
+    cleaned = " ".join((text or "").split())
+    if len(cleaned) <= max_len:
+        return cleaned
+    return f"{cleaned[:max_len - 3]}..."
+
+def compliments_keyboard(messages):
+    rows = []
+    for msg in messages:
+        label = shorten_text(msg.text)
+        if msg.day_index:
+            label = f"{msg.day_index}: {label}"
+        rows.append([InlineKeyboardButton(
+            text=label,
+            callback_data=f"compliment:send:{msg.id}",
+        )])
+    rows.append([InlineKeyboardButton(text="Еще", callback_data="compliment:next")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def parse_send_selector(raw: str):
+    cleaned = (raw or "").strip().lower()
+    if not cleaned:
+        return None, None
+    if cleaned.startswith("id=") or cleaned.startswith("id:"):
+        value = cleaned.split("=", 1)[1] if "id=" in cleaned else cleaned.split(":", 1)[1]
+        return "id", value.strip()
+    if cleaned.startswith("day=") or cleaned.startswith("day:"):
+        value = cleaned.split("=", 1)[1] if "day=" in cleaned else cleaned.split(":", 1)[1]
+        return "day", value.strip()
+    return "day", cleaned
 
 async def get_active_rules(session):
     return (await session.scalars(
@@ -228,6 +271,10 @@ async def help_command(message: Message):
             "/proofs — последние доказательства\n"
             "/test_schedule — отправить случайное сообщение\n"
             "/send_random — отправить случайное сообщение\n"
+            "/send_daily_now — отправить сообщение за сегодня вручную\n"
+            "/send_compliment <day|id> — отправить комплимент по номеру дня или id\n"
+            "/pick_compliment — выбрать и отправить комплимент вручную\n"
+            "/schedule_status — показать текущие настройки расписания\n"
             "/schedule_all — все 365 сообщений\n"
             "/outbox — сообщение на завтра\n"
             "/set_tomorrow — изменить сообщение на завтра\n"
@@ -342,20 +389,47 @@ async def send_random_to_users(bot, chat_id: int):
             await bot.send_message(chat_id, "Нет пользователей для отправки (нужен consent).")
             return
 
+    delivered, total = await send_text_to_users(bot, template_msg.text)
+    await bot.send_message(
+        chat_id,
+        f"Случайное сообщение отправлено: {delivered} из {total} пользователей."
+    )
+
+async def send_text_to_users(bot, text: str):
+    async with AsyncSessionLocal() as session:
+        users = (await session.scalars(
+            select(User)
+            .where(User.consent.is_(True))
+            .where(User.tg_user_id != ADMIN_TG_ID)
+            .order_by(User.id)
+        )).all()
+    if not users:
+        return 0, 0
+
     delivered = 0
     for user in users:
         try:
-            await bot.send_message(user.tg_chat_id, template_msg.text)
+            await bot.send_message(user.tg_chat_id, text)
             delivered += 1
         except TelegramNetworkError:
             continue
         except Exception:
             continue
+    return delivered, len(users)
 
-    await bot.send_message(
-        chat_id,
-        f"Случайное сообщение отправлено: {delivered} пользователям."
-    )
+async def send_compliment_by_selector(bot, selector_type, selector_num):
+    async with AsyncSessionLocal() as session:
+        if selector_type == "id":
+            msg = await session.get(ScheduleMessage, selector_num)
+        else:
+            msg = await session.scalar(
+                select(ScheduleMessage).where(ScheduleMessage.day_index == selector_num)
+            )
+            if not msg:
+                msg = await session.get(ScheduleMessage, selector_num)
+    if not msg or not msg.text:
+        return None, None
+    return await send_text_to_users(bot, msg.text)
 
 async def get_primary_user(session):
     return await session.scalar(select(User).order_by(User.id))
@@ -565,11 +639,50 @@ async def cancel_tomorrow(message: Message):
     else:
         await message.answer("Нет активного редактирования.")
 
+@router.message(F.text == "/cancel_compliment")
+async def cancel_compliment(message: Message):
+    if message.from_user.id != ADMIN_TG_ID:
+        return
+    if message.from_user.id in ADMIN_PENDING_COMPLIMENT:
+        ADMIN_PENDING_COMPLIMENT.discard(message.from_user.id)
+        await message.answer("Отменено.")
+    else:
+        await message.answer("Нет активного выбора комплимента.")
+
 @router.message(F.text == "/schedule_all")
 async def schedule_all(message: Message):
     if message.from_user.id != ADMIN_TG_ID:
         return
     await send_admin_schedule(message.bot, message.chat.id)
+
+@router.message(F.text == "/schedule_status")
+async def schedule_status(message: Message):
+    if message.from_user.id != ADMIN_TG_ID:
+        return
+
+    tz = pytz_timezone(TIMEZONE)
+    now_local = datetime.now(tz)
+    today_local = now_local.date()
+
+    async with AsyncSessionLocal() as session:
+        next_msg = await session.scalar(
+            select(ScheduleMessage)
+            .where(ScheduleMessage.send_date >= today_local)
+            .where(ScheduleMessage.sent_at.is_(None))
+            .order_by(ScheduleMessage.send_date)
+        )
+
+    lines = [
+        f"Сейчас: {now_local.strftime('%Y-%m-%d %H:%M')} {TIMEZONE}",
+        f"Дневная рассылка: {SEND_HOUR:02d}:{SEND_MINUTE:02d} {TIMEZONE}",
+        f"Напоминания: {REMINDER_HOUR:02d}:{REMINDER_MINUTE:02d} {TIMEZONE}",
+        f"USE_CELERY={int(USE_CELERY)} ENABLE_SCHEDULES={int(ENABLE_SCHEDULES)}",
+    ]
+    if next_msg and next_msg.send_date:
+        lines.append(f"Следующее сообщение: {next_msg.send_date.isoformat()}")
+    else:
+        lines.append("Следующее сообщение: нет")
+    await message.answer("\n".join(lines))
 
 @router.message(F.text == "/send_random")
 async def send_random(message: Message):
@@ -577,8 +690,76 @@ async def send_random(message: Message):
         return
     await send_random_to_users(message.bot, message.chat.id)
 
+@router.message(F.text == "/send_daily_now")
+async def send_daily_now(message: Message):
+    if message.from_user.id != ADMIN_TG_ID:
+        return
+    await send_daily(message.bot)
+    await message.answer("Попытался отправить дневное сообщение.")
+
+@router.message(F.text.startswith("/send_compliment"))
+async def send_compliment(message: Message):
+    if message.from_user.id != ADMIN_TG_ID:
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Укажи номер дня или id, например: /send_compliment 25 или /send_compliment id=123")
+        return
+
+    selector_type, selector_value = parse_send_selector(parts[1])
+    try:
+        selector_num = int(selector_value)
+    except (TypeError, ValueError):
+        await message.answer("Нужно число, например: /send_compliment 25 или /send_compliment id=123")
+        return
+
+    delivered, total = await send_compliment_by_selector(message.bot, selector_type, selector_num)
+    if delivered is None:
+        await message.answer("Сообщение не найдено.")
+        return
+
+    await message.answer(f"Отправлено: {delivered} из {total} пользователей.")
+
+@router.message(F.text == "/pick_compliment")
+async def pick_compliment(message: Message):
+    if message.from_user.id != ADMIN_TG_ID:
+        return
+    async with AsyncSessionLocal() as session:
+        messages = (await session.scalars(
+            select(ScheduleMessage)
+            .order_by(func.random())
+            .limit(COMPLIMENT_PAGE_SIZE)
+        )).all()
+    if not messages:
+        await message.answer("В базе нет сообщений.")
+        return
+    await message.answer(
+        "Выбери комплимент для отправки:",
+        reply_markup=compliments_keyboard(messages),
+    )
+
 @router.message()
 async def inbox(message: Message):
+    if message.from_user.id == ADMIN_TG_ID and message.from_user.id in ADMIN_PENDING_COMPLIMENT:
+        text = extract_text(message).strip()
+        if not text:
+            await message.answer("Нужен номер дня или id. Отмена: /cancel_compliment")
+            return
+        ADMIN_PENDING_COMPLIMENT.discard(message.from_user.id)
+        selector_type, selector_value = parse_send_selector(text)
+        try:
+            selector_num = int(selector_value)
+        except (TypeError, ValueError):
+            await message.answer("Нужно число, например: 25 или id=123")
+            return
+        delivered, total = await send_compliment_by_selector(message.bot, selector_type, selector_num)
+        if delivered is None:
+            await message.answer("Сообщение не найдено.")
+            return
+        await message.answer(f"Отправлено: {delivered} из {total} пользователей.")
+        return
+
     if message.from_user.id == ADMIN_TG_ID and message.from_user.id in ADMIN_PENDING_TOMORROW:
         text = extract_text(message).strip()
         if not text:
@@ -887,16 +1068,84 @@ async def admin_menu_callback(callback: CallbackQuery):
         await callback.message.answer("Пришли новый текст для завтрашнего сообщения. Отмена: /cancel_tomorrow")
     elif action == "schedule":
         await send_admin_schedule(callback.message.bot, callback.message.chat.id)
+    elif action == "send_daily":
+        await send_daily(callback.message.bot)
+        await callback.message.answer("Попытался отправить дневное сообщение.")
+    elif action == "schedule_status":
+        await schedule_status(callback.message)
+    elif action == "compliment_by_number":
+        ADMIN_PENDING_COMPLIMENT.add(callback.from_user.id)
+        await callback.message.answer(
+            "Пришли номер дня или id сообщения (например: 25 или id=123). Отмена: /cancel_compliment"
+        )
     elif action == "reset":
         await callback.message.answer("Сброс дат отключен.")
     elif action in ("random", "test"):
         await send_random_to_users(callback.message.bot, callback.message.chat.id)
+    elif action == "compliment":
+        await pick_compliment(callback.message)
     else:
         await callback.answer("Неизвестно.")
         return
 
     await callback.answer()
 
+@router.callback_query(F.data.startswith("compliment:"))
+async def compliment_callback(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_TG_ID:
+        await callback.answer("Недоступно.")
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) < 2:
+        await callback.answer("Ошибка данных.")
+        return
+
+    action = parts[1]
+    if action == "next":
+        async with AsyncSessionLocal() as session:
+            messages = (await session.scalars(
+                select(ScheduleMessage)
+                .order_by(func.random())
+                .limit(COMPLIMENT_PAGE_SIZE)
+            )).all()
+        if not messages:
+            await callback.answer("В базе нет сообщений.")
+            return
+        try:
+            await callback.message.edit_text(
+                "Выбери комплимент для отправки:",
+                reply_markup=compliments_keyboard(messages),
+            )
+        except Exception:
+            await callback.message.answer(
+                "Выбери комплимент для отправки:",
+                reply_markup=compliments_keyboard(messages),
+            )
+        await callback.answer()
+        return
+
+    if action != "send" or len(parts) != 3:
+        await callback.answer("Ошибка данных.")
+        return
+
+    try:
+        msg_id = int(parts[2])
+    except ValueError:
+        await callback.answer("Ошибка данных.")
+        return
+
+    async with AsyncSessionLocal() as session:
+        msg = await session.get(ScheduleMessage, msg_id)
+    if not msg or not msg.text:
+        await callback.answer("Сообщение не найдено.")
+        return
+
+    delivered, total = await send_text_to_users(callback.message.bot, msg.text)
+    await callback.message.answer(
+        f"Отправлено: {delivered} из {total} пользователей."
+    )
+    await callback.answer("Готово.")
 
 @router.callback_query(F.data.startswith("user:"))
 async def user_menu_callback(callback: CallbackQuery):
