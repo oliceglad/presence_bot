@@ -1749,10 +1749,11 @@ async def action_admin_callback(callback: CallbackQuery):
             return
 
         # Award points
-        user_model = await session.get(User, inbox.user_id)
-        if user_model:
-            user_model.points = (user_model.points or 0) + 10
-            await session.commit()
+        async with AsyncSessionLocal() as session:
+            user_model = await session.get(User, inbox.user_id)
+            if user_model:
+                user_model.points = (user_model.points or 0) + 10
+                await session.commit()
 
         await clear_inline_keyboard(callback.message)
         await callback.answer("Продлено +10 баллов.")
