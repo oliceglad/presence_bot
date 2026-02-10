@@ -11,6 +11,7 @@ from app.config import BOT_TOKEN, ADMIN_TG_ID
 from app.db import make_engine
 from app.scheduler import send_daily, send_outbox, send_reminders
 from app.models import User, ScheduleMessage
+from aiogram.types import FSInputFile
 
 logger = logging.getLogger(__name__)
 
@@ -81,3 +82,35 @@ async def send_random(bot, session_factory):
 @celery_app.task(name="app.tasks.send_random_task")
 def send_random_task():
     asyncio.run(_run_with_bot_and_db(send_random))
+
+
+async def send_broadcast(bot, session_factory, text: str, image_path: str = None):
+    async with session_factory() as session:
+        users = (await session.scalars(select(User))).all()
+        
+    logger.info(f"Starting broadcast to {len(users)} users...")
+    delivered = 0
+    errors = 0
+    
+    photo = FSInputFile(image_path) if image_path else None
+    
+    for user in users:
+        try:
+            if photo:
+                await bot.send_photo(user.tg_chat_id, photo, caption=text)
+            else:
+                await bot.send_message(user.tg_chat_id, text)
+            delivered += 1
+            await asyncio.sleep(0.1) # Avoid flood limits
+        except Exception as e:
+            logger.error(f"Failed to send to {user.id}: {e}")
+            errors += 1
+            
+    logger.info(f"Broadcast finished. Delivered: {delivered}, Errors: {errors}")
+
+
+@celery_app.task(name="app.tasks.send_broadcast_task")
+def send_broadcast_task(text: str, image_path: str = None):
+    asyncio.run(_run_with_bot_and_db(
+        lambda bot, session_factory: send_broadcast(bot, session_factory, text, image_path)
+    ))

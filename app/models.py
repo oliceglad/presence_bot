@@ -17,6 +17,7 @@ class User(Base):
     last_inactivity_reminder_at = Column(DateTime, nullable=True)
     last_expiry_reminder_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
+    points = Column(Integer, default=0)
 
 
 class ScheduleMessage(Base):
@@ -79,3 +80,35 @@ class ActionEvent(Base):
     old_expires_at = Column(DateTime, nullable=True)
     new_expires_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
+
+
+class SupportMessage(Base):
+    __tablename__ = "support_messages"
+
+    id = Column(Integer, primary_key=True)
+    key = Column(String, unique=True, nullable=False) # e.g. "sad", "bored"
+    title = Column(String, nullable=False) # Button text
+    media_type = Column(String, nullable=True) # photo, video, voice, text
+    media_file_id = Column(String, nullable=True)
+    text = Column(Text, nullable=True)
+
+
+class Coupon(Base):
+    __tablename__ = "coupons"
+
+    id = Column(Integer, primary_key=True)
+    title = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    cost = Column(Integer, nullable=False)
+    active = Column(Boolean, default=True)
+
+
+class UserCoupon(Base):
+    __tablename__ = "user_coupons"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    coupon_id = Column(Integer, ForeignKey("coupons.id"))
+    status = Column(String, default="active") # active, used
+    created_at = Column(DateTime, server_default=func.now())
+    redeemed_at = Column(DateTime, nullable=True)

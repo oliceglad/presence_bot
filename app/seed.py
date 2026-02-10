@@ -7,7 +7,7 @@ from pathlib import Path
 from sqlalchemy import select
 
 from app.db import AsyncSessionLocal
-from app.models import ScheduleMessage, ActionRule
+from app.models import ScheduleMessage, ActionRule, SupportMessage, Coupon
 
 
 def resolve_csv_path(path: str | None) -> Path:
@@ -92,6 +92,51 @@ async def ensure_action_rules():
         await session.commit()
 
 
+async def ensure_support_messages():
+    async with AsyncSessionLocal() as session:
+        # Default support messages
+        defaults = [
+            {"key": "sad", "title": "Грустно", "text": "Не грусти, малыш! Я всегда с тобой. Обнимаю крепко-крепко! ❤️\nПомни, что ты у меня самая лучшая."},
+            {"key": "tired", "title": "Устала", "text": "Ты большая умница и очень много делаешь. Отдохни немного, выпей чаю ☕️ и расслабься."},
+            {"key": "bored", "title": "Скучно", "text": "Может быть, посмотрим кино? Или напиши мне, я всегда рад поболтать! 😉"},
+            {"key": "miss", "title": "Скучаю", "text": "Я тоже очень скучаю по тебе! Скоро мы увидимся. Люблю тебя бесконечно! 💕"},
+        ]
+        
+        for data in defaults:
+            existing = await session.scalar(select(SupportMessage).where(SupportMessage.key == data["key"]))
+            if not existing:
+                session.add(SupportMessage(
+                    key=data["key"],
+                    title=data["title"],
+                    text=data["text"],
+                    media_type="text",
+                    media_file_id=None
+                ))
+        await session.commit()
+
+
+async def ensure_default_coupons():
+    async with AsyncSessionLocal() as session:
+        defaults = [
+            {"title": "💆‍♀️ Массаж от меня (30 мин)", "cost": 50},
+            {"title": "🍿 Киновечер (ты выбираешь фильм)", "cost": 30},
+            {"title": "🍫 Вкусняшка", "cost": 10},
+            {"title": "🍽 Ужин который приготовлю я", "cost": 70},
+            {"title": "❤️ Любое желание (в пределах разумного)", "cost": 150},
+        ]
+
+        for data in defaults:
+            existing = await session.scalar(select(Coupon).where(Coupon.title == data["title"]))
+            if not existing:
+                session.add(Coupon(
+                    title=data["title"],
+                    cost=data["cost"],
+                    active=True
+                ))
+        
+        await session.commit()
+
+
 async def main():
     parser = argparse.ArgumentParser(description="Seed and sync schedule messages.")
     parser.add_argument(
@@ -112,7 +157,10 @@ async def main():
         await upsert_csv(csv_path)
     else:
         await import_csv_if_empty(csv_path)
+    
     await ensure_action_rules()
+    await ensure_support_messages()
+    await ensure_default_coupons()
 
 
 if __name__ == "__main__":

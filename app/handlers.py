@@ -1,11 +1,20 @@
 import csv
 import io
+import asyncio
+import logging
+import random
+from typing import Optional
 from datetime import datetime, timedelta
 from aiogram import Router, F
+from aiogram.filters import StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     Message,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
     CallbackQuery,
     BufferedInputFile,
 )
@@ -19,7 +28,13 @@ from app.models import (
     Subscription,
     ActionRule,
     ActionEvent,
+    Subscription,
+    ActionRule,
+    ActionEvent,
     ScheduleMessage,
+    SupportMessage,
+    Coupon,
+    UserCoupon,
 )
 from app.config import (
     ADMIN_TG_ID,
@@ -39,8 +54,14 @@ from app.scheduler import send_daily
 router = Router()
 ADMIN_PENDING_TOMORROW = set()
 ADMIN_PENDING_COMPLIMENT = set()
+ADMIN_PENDING_BROADCAST = {} # admin_id -> {text, media_type, media_file_id}
+ADMIN_PENDING_MESSAGE_USER_ID = {} # admin_id -> target_user_id
 COMPLIMENT_PAGE_SIZE = 10
 COMPLIMENT_BUTTON_MAX = 48
+
+class UserStates(StatesGroup):
+    waiting_for_proof = State()
+    waiting_for_valentine_proof = State()
 
 TASKS = [
     "10 минут прогулки",
@@ -52,31 +73,46 @@ TASKS = [
 
 PROOF_HINT = "Нужны фото/кружок/видео."
 
-def admin_menu_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Статус подписки", callback_data="admin:status")],
-            [InlineKeyboardButton(text="Пользователь", callback_data="admin:user")],
-            [InlineKeyboardButton(text="Все 365 сообщений", callback_data="admin:schedule")],
-            [InlineKeyboardButton(text="Доказательства", callback_data="admin:proofs")],
-            [InlineKeyboardButton(text="Сообщение на завтра", callback_data="admin:next")],
-            [InlineKeyboardButton(text="Изменить сообщение на завтра", callback_data="admin:edit_next")],
-            [InlineKeyboardButton(text="Случайное сообщение", callback_data="admin:random")],
-            [InlineKeyboardButton(text="Выбрать комплимент", callback_data="admin:compliment")],
-            [InlineKeyboardButton(text="Отправить сегодня", callback_data="admin:send_daily")],
-            [InlineKeyboardButton(text="Статус расписания", callback_data="admin:schedule_status")],
-            [InlineKeyboardButton(text="Комплимент по номеру", callback_data="admin:compliment_by_number")],
-        ]
+def admin_reply_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="История сообщений")],
+            [KeyboardButton(text="Статус подписки"), KeyboardButton(text="Пользователь")],
+            [KeyboardButton(text="Все 365 сообщений"), KeyboardButton(text="Сообщение на завтра")],
+            [KeyboardButton(text="Изменить на завтра"), KeyboardButton(text="Отправить сегодня")],
+            [KeyboardButton(text="Написать пользователю"), KeyboardButton(text="📢 Рассылка")],
+        ],
+        resize_keyboard=True
     )
 
-def user_menu_inline_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Меню", callback_data="user:menu")],
-            [InlineKeyboardButton(text="📖 Правила", callback_data="user:rules")],
-            [InlineKeyboardButton(text="💳 Подписка", callback_data="user:status")],
-        ]
+def user_reply_keyboard():
+    rows = [
+        [KeyboardButton(text="📋 Меню"), KeyboardButton(text="📤 Отправить отчет")],
+        [KeyboardButton(text="💳 Подписка"), KeyboardButton(text="📖 Правила")],
+        [KeyboardButton(text="🛍 Магазин"), KeyboardButton(text="🎒 Мои купоны"), KeyboardButton(text="🆘 Поддержка")],
+    ]
+    
+    # Valentine's Season (Feb 11 - Feb 15)
+    now = datetime.now()
+    if now.month == 2 and 11 <= now.day <= 14:
+        rows.insert(0, [KeyboardButton(text="💘 14 Февраля")])
+        
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+def valentine_reply_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="💌 Задание дня"), KeyboardButton(text="📤 Отчет по заданию")],
+            [KeyboardButton(text="🔮 Предсказание"), KeyboardButton(text="🔙 Назад")],
+        ],
+        resize_keyboard=True
     )
+
+def valentine_admin_keyboard(inbox_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Принять (+5 баллов)", callback_data=f"val_quest:approve:{inbox_id}")],
+        [InlineKeyboardButton(text="⛔️ Отклонить", callback_data=f"val_quest:deny:{inbox_id}")]
+    ])
 
 def action_rules_keyboard(rules, inbox_id: int, prefix: str, include_deny: bool = False):
     rows = []
@@ -107,6 +143,10 @@ def extract_media(message: Message):
         return "video", message.video.file_id
     if message.video_note:
         return "video_note", message.video_note.file_id
+    if message.voice:
+        return "voice", message.voice.file_id
+    if message.sticker:
+        return "sticker", message.sticker.file_id
     return None, None
 
 def has_proof_media(message: Message) -> bool:
@@ -143,6 +183,12 @@ def parse_send_selector(raw: str):
         return "day", value.strip()
     return "day", cleaned
 
+
+def extract_sticker(message: Message):
+    if message.sticker:
+        return "sticker", message.sticker.file_id
+    return None, None
+
 async def get_active_rules(session):
     return (await session.scalars(
         select(ActionRule)
@@ -169,8 +215,8 @@ async def start(message: Message):
                 user.tg_chat_id = message.chat.id
             await session.commit()
         await message.answer(
-            "Админ режим. Доступны команды: /status, /rules, /test_schedule, /proofs, /help, /admin",
-            reply_markup=admin_menu_keyboard()
+            "Админ режим. Клавиатура обновлена.",
+            reply_markup=admin_reply_keyboard()
         )
         return
 
@@ -210,7 +256,12 @@ async def consent(message: Message):
     if message.text.strip().lower() in ("да", "✅ да"):
         if sub and sub.expires_at:
             expires = sub.expires_at.strftime("%Y-%m-%d %H:%M")
-            await message.answer(f"Подписка активна до {expires}.")
+        if sub and message.from_user.id != ADMIN_TG_ID:
+            expires = sub.expires_at.strftime("%Y-%m-%d %H:%M")
+            await message.bot.send_message(
+                ADMIN_TG_ID,
+                f"Старт подписки: до {expires}"
+            )
         await message.answer(
             "Хорошо 🤍\n"
             "Это твой личный дневник. Я сохраняю все сообщения и действия.\n"
@@ -219,9 +270,9 @@ async def consent(message: Message):
         )
         await message.answer(
             "Подписка действует 1 месяц и продлевается за действия.\n"
-            "Для задания укажи, что сделала: /rules"
+            "Для задания укажи, что сделала: /rules",
+            reply_markup=user_reply_keyboard()
         )
-        await message.answer("Пользовательское меню:", reply_markup=user_menu_inline_keyboard())
         if sub and message.from_user.id != ADMIN_TG_ID:
             expires = sub.expires_at.strftime("%Y-%m-%d %H:%M")
             await message.bot.send_message(
@@ -244,61 +295,67 @@ async def rules(message: Message):
         await message.answer("Правила пока не настроены.")
         return
 
-    lines = ["Правила продления:"]
+    lines = [
+        "📋 **Правила продления**",
+        "Каждое действие продлевает подписку:",
+    ]
     for rule in rules_list:
-        lines.append(f"- {rule.title}: +{rule.days_to_extend} дн.")
+        lines.append(f"🔹 **{rule.title}**: +{rule.days_to_extend} дн.")
+    
+    lines.append("")
+    lines.append("📸 **Как продлить:**")
+    lines.append("Отправь фото, видео или кружок в этот чат. Админ проверит и подтвердит.")
     lines.append(PROOF_HINT)
-    lines.append("Как продлить: отправь фото/кружок/видео, админ подтвердит действие.")
-    lines.append("После отправки выбери действие из списка.")
-    lines.append("Задания:")
+    
+    lines.append("")
+    lines.append("💎 **Баллы и Магазин**")
+    lines.append("✅ За каждое подтвержденное действие: **+10 баллов**!")
+    lines.append("Трать баллы в **Магазине** на купоны (массаж, свидание и др.).")
+    
+    lines.append("")
+    lines.append("🎒 **Купоны**")
+    lines.append("Купленные купоны хранятся в меню '🎒 Мои купоны'.")
+    
+    lines.append("")
+    lines.append("📝 **Идеи для заданий:**")
     for task in TASKS:
-        lines.append(f"- {task}")
-    await message.answer("\n".join(lines))
+        lines.append(f"• {task}")
+        
+    await message.answer("\n".join(lines), parse_mode="Markdown")
 
 @router.message(F.text == "/admin")
 async def admin_menu(message: Message):
     if message.from_user.id != ADMIN_TG_ID:
         return
-    await message.answer("Меню админа:", reply_markup=admin_menu_keyboard())
+    await message.answer("Меню админа:", reply_markup=admin_reply_keyboard())
 
-@router.message(F.text == "/help")
-async def help_command(message: Message):
-    if message.from_user.id == ADMIN_TG_ID:
-        await message.answer(
-            "Команды админа:\n"
-            "/status — статус подписки\n"
-            "/rules — правила продления\n"
-            "/proofs — последние доказательства\n"
-            "/test_schedule — отправить случайное сообщение\n"
-            "/send_random — отправить случайное сообщение\n"
-            "/send_daily_now — отправить сообщение за сегодня вручную\n"
-            "/send_compliment <day|id> — отправить комплимент по номеру дня или id\n"
-            "/pick_compliment — выбрать и отправить комплимент вручную\n"
-            "/schedule_status — показать текущие настройки расписания\n"
-            "/schedule_all — все 365 сообщений\n"
-            "/outbox — сообщение на завтра\n"
-            "/set_tomorrow — изменить сообщение на завтра\n"
-            "/admin — меню админа\n"
-            "Проверка доказательств: выбери действие или «Отклонить» под медиа"
-        )
-    else:
-        await message.answer(
-            "Возможности бота:\n"
-            "- сохраняет твои сообщения\n"
-            "- продлевает подписку за действия\n"
-            "- показывает правила: /rules\n"
-            "- показывает статус подписки: /my_status\n"
-            "- пауза напоминаний: /snooze 7, вернуть: /unsnooze\n"
-            "Как продлить: отправь фото/кружок/видео, админ подтвердит действие.\n"
-            "Открыть меню: /menu"
-        )
+
+
 
 @router.message(F.text == "/menu")
 async def user_menu_command(message: Message):
     if message.from_user.id == ADMIN_TG_ID:
-        await message.answer("Меню админа:", reply_markup=admin_menu_keyboard())
+        await message.answer("Меню админа:", reply_markup=admin_reply_keyboard())
         return
-    await message.answer("Пользовательское меню:", reply_markup=user_menu_inline_keyboard())
+    await message.answer("Пользовательское меню:", reply_markup=user_reply_keyboard())
+
+@router.message(F.text == "📋 Меню")
+async def user_menu_text(message: Message):
+    if message.from_user.id == ADMIN_TG_ID:
+        return
+    await message.answer("меню", reply_markup=user_reply_keyboard())
+
+@router.message(F.text == "📖 Правила")
+async def user_rules_text(message: Message):
+    await rules(message)
+
+@router.message(F.text == "💳 Подписка")
+async def user_status_text(message: Message):
+    await my_status(message)
+
+@router.message(F.text == "🆘 Помощь")
+async def user_help_text(message: Message):
+    await help_command(message)
 
 
 async def get_user_status_text(tg_user_id: int) -> str:
@@ -446,7 +503,14 @@ async def send_admin_status(bot, chat_id: int):
     expires = sub.expires_at.strftime("%Y-%m-%d %H:%M") if sub and sub.expires_at else "нет"
     await bot.send_message(chat_id, f"Подписка до: {expires}")
 
-async def send_admin_user(bot, chat_id: int):
+@router.message(F.text.in_({"/admin_user", "Пользователь"}))
+async def admin_user(message: Message):
+    if message.from_user.id != ADMIN_TG_ID:
+        return
+    await send_admin_user_func(message.bot, message.chat.id)
+
+async def send_admin_user_func(bot, chat_id: int):
+
     async with AsyncSessionLocal() as session:
         user = await get_primary_user(session)
     if not user:
@@ -479,6 +543,10 @@ async def send_admin_inbox(bot, chat_id: int):
             await bot.send_video(chat_id, msg.media_file_id, caption=msg.text)
         elif msg.media_type == "video_note":
             await bot.send_video_note(chat_id, msg.media_file_id)
+        elif msg.media_type == "voice":
+            await bot.send_voice(chat_id, msg.media_file_id, caption=msg.text)
+        elif msg.media_type == "sticker":
+            await bot.send_sticker(chat_id, msg.media_file_id)
         else:
             await bot.send_message(chat_id, msg.text or "[медиа]")
 
@@ -505,6 +573,10 @@ async def send_admin_proofs(bot, chat_id: int):
             await bot.send_video(chat_id, msg.media_file_id, caption=msg.text)
         elif msg.media_type == "video_note":
             await bot.send_video_note(chat_id, msg.media_file_id)
+        elif msg.media_type == "voice":
+            await bot.send_voice(chat_id, msg.media_file_id, caption=msg.text)
+        elif msg.media_type == "sticker":
+            await bot.send_sticker(chat_id, msg.media_file_id)
         else:
             await bot.send_message(chat_id, msg.text or "[медиа]")
 
@@ -576,7 +648,35 @@ async def update_admin_tomorrow_message(text: str):
         await session.commit()
         return tomorrow
 
-@router.message(F.text == "/status")
+async def send_admin_history(bot, chat_id: int):
+    async with AsyncSessionLocal() as session:
+        # Fetch sent messages
+        sent_msgs = (await session.scalars(
+            select(ScheduleMessage)
+            .where(ScheduleMessage.sent_at.is_not(None))
+            .order_by(desc(ScheduleMessage.sent_at))
+            .limit(20)
+        )).all()
+    
+    if not sent_msgs:
+        await bot.send_message(chat_id, "История отправленных сообщений пуста.")
+        return
+
+    lines = ["Последние 20 отправленных сообщений:"]
+    for msg in sent_msgs:
+        when = msg.sent_at.strftime("%Y-%m-%d %H:%M")
+        text_snippet = (msg.text or "")[:30].replace("\n", " ")
+        lines.append(f"- {when}: {text_snippet}...")
+    
+    await bot.send_message(chat_id, "\n".join(lines))
+
+@router.message(F.text == "История сообщений")
+async def admin_history(message: Message):
+    if message.from_user.id != ADMIN_TG_ID:
+        return
+    await send_admin_history(message.bot, message.chat.id)
+
+@router.message(F.text.in_({"/status", "Статус подписки"}))
 async def status(message: Message):
     if message.from_user.id != ADMIN_TG_ID:
         return
@@ -616,13 +716,13 @@ async def proofs(message: Message):
         return
     await send_admin_proofs(message.bot, message.chat.id)
 
-@router.message(F.text == "/outbox")
+@router.message(F.text.in_({"/outbox", "Сообщение на завтра"}))
 async def outbox(message: Message):
     if message.from_user.id != ADMIN_TG_ID:
         return
     await send_admin_next_message(message.bot, message.chat.id)
 
-@router.message(F.text == "/set_tomorrow")
+@router.message(F.text.in_({"/set_tomorrow", "Изменить на завтра"}))
 async def set_tomorrow(message: Message):
     if message.from_user.id != ADMIN_TG_ID:
         return
@@ -649,7 +749,7 @@ async def cancel_compliment(message: Message):
     else:
         await message.answer("Нет активного выбора комплимента.")
 
-@router.message(F.text == "/schedule_all")
+@router.message(F.text.in_({"/schedule_all", "Все 365 сообщений"}))
 async def schedule_all(message: Message):
     if message.from_user.id != ADMIN_TG_ID:
         return
@@ -690,7 +790,7 @@ async def send_random(message: Message):
         return
     await send_random_to_users(message.bot, message.chat.id)
 
-@router.message(F.text == "/send_daily_now")
+@router.message(F.text.in_({"/send_daily_now", "Отправить сегодня"}))
 async def send_daily_now(message: Message):
     if message.from_user.id != ADMIN_TG_ID:
         return
@@ -739,8 +839,609 @@ async def pick_compliment(message: Message):
         reply_markup=compliments_keyboard(messages),
     )
 
+@router.message(F.text == "/help")
+async def help_command(message: Message):
+    if message.from_user.id == ADMIN_TG_ID:
+        await message.answer(
+            "Команды админа:\n"
+            "Кнопки меню внизу экрана.\n\n"
+            "Доп. команды:\n"
+            "/rules — правила продления\n"
+            "/proofs — последние доказательства\n"
+            "/send_compliment <day|id>\n"
+            "/pick_compliment — выбрать комплимент\n"
+            "/schedule_status\n\n"
+            "Проверка доказательств: придет уведомление с кнопками."
+        )
+    else:
+        await message.answer(
+            "Возможности бота:\n"
+            "- сохраняет твои сообщения\n"
+            "- продлевает подписку за действия\n"
+            "- показывает правила: /rules\n"
+            "- показывает статус подписки: /my_status\n"
+            "- пауза напоминаний: /snooze 7, вернуть: /unsnooze\n"
+            "Как продлить: отправь фото/кружок/видео, админ подтвердит действие.\n"
+            "Открыть меню: /menu"
+        )
+
+
+async def send_support_keyboard(message: Message):
+    async with AsyncSessionLocal() as session:
+        items = (await session.scalars(select(SupportMessage))).all()
+
+    if not items:
+        await message.answer("Раздел поддержки пока пуст.")
+        return
+
+    # Create rows of buttons
+    rows = []
+    for item in items:
+        rows.append([KeyboardButton(text=f"🆘 {item.title}")])
+    rows.append([KeyboardButton(text="🔙 Назад")])
+
+    kb = ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+    await message.answer("Что случилось? Выбери вариант:", reply_markup=kb)
+
+
+@router.message(F.text == "🆘 Поддержка")
+async def user_support_menu(message: Message):
+    await send_support_keyboard(message)
+
+@router.message(F.text == "🔙 Назад")
+async def back_to_main(message: Message):
+    await message.answer("Главное меню", reply_markup=user_reply_keyboard())
+
+
+@router.message(F.text.startswith("🆘 "))
+async def support_content_handler(message: Message):
+    title = message.text[2:] # strip "🆘 "
+    async with AsyncSessionLocal() as session:
+        item = await session.scalar(select(SupportMessage).where(SupportMessage.title == title))
+
+    if not item:
+        # Might be a mismatch or old button
+        return
+
+    # Send content
+    chat_id = message.chat.id
+    bot = message.bot
+    try:
+        if item.media_type == "sticker":
+            await bot.send_sticker(chat_id, item.media_file_id)
+        elif item.media_type == "photo":
+            await bot.send_photo(chat_id, item.media_file_id, caption=item.text)
+        elif item.media_type == "video":
+            await bot.send_video(chat_id, item.media_file_id, caption=item.text)
+        elif item.media_type == "voice":
+            await bot.send_voice(chat_id, item.media_file_id, caption=item.text)
+        elif item.text:
+            await bot.send_message(chat_id, item.text)
+        else:
+            await bot.send_message(chat_id, "Сообщение поддержки.")
+    except Exception:
+        await bot.send_message(chat_id, "Ошибка при отправке поддержки.")
+
+
+ADMIN_PENDING_SUPPORT = {} # admin_id -> {key, title}
+
+@router.message(F.text.startswith("/add_support"))
+async def add_support_start(message: Message):
+    # Usage: /add_support <key> <Button Title>
+    if message.from_user.id != ADMIN_TG_ID:
+        return
+    
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer("Формат: /add_support <key> <Текст кнопки>\nПример: /add_support sad Грустно")
+        return
+    
+    key = parts[1]
+    title = parts[2]
+    
+    ADMIN_PENDING_SUPPORT[message.from_user.id] = {"key": key, "title": title}
+    await message.answer(f"Добавляем поддержку '{title}' (key={key}).\nПришли контент (текст/фото/видео/стикер/войс) или /cancel")
+
+@router.message(lambda m: m.from_user.id == ADMIN_TG_ID and m.from_user.id in ADMIN_PENDING_SUPPORT)
+async def add_support_content(message: Message):
+    if message.text == "/cancel":
+        ADMIN_PENDING_SUPPORT.pop(message.from_user.id)
+        await message.answer("Отменено.")
+        return
+
+    data = ADMIN_PENDING_SUPPORT.pop(message.from_user.id)
+    key = data["key"]
+    title = data["title"]
+    
+    content_text = message.text or message.caption
+    media_type = None
+    media_file_id = None
+    
+    if message.sticker:
+        media_type = "sticker"
+        media_file_id = message.sticker.file_id
+    elif message.photo:
+        media_type = "photo"
+        media_file_id = message.photo[-1].file_id
+    elif message.video:
+        media_type = "video"
+        media_file_id = message.video.file_id
+    elif message.voice:
+        media_type = "voice"
+        media_file_id = message.voice.file_id
+    
+    async with AsyncSessionLocal() as session:
+        # Check if exists
+        existing = await session.scalar(select(SupportMessage).where(SupportMessage.key == key))
+        if existing:
+            existing.title = title
+            existing.text = content_text
+            existing.media_type = media_type
+            existing.media_file_id = media_file_id
+            await message.answer(f"Обновлено: {title}")
+        else:
+            session.add(SupportMessage(
+                key=key,
+                title=title,
+                text=content_text,
+                media_type=media_type,
+                media_file_id=media_file_id
+            ))
+            await message.answer(f"Создано: {title}")
+        await session.commit()
+
+
+@router.message(F.text == "🛍 Магазин")
+async def user_shop_menu(message: Message):
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(select(User).where(User.tg_user_id == message.from_user.id))
+        coupons = (await session.scalars(select(Coupon).where(Coupon.active.is_(True)))).all()
+
+    points = user.points or 0
+    text = f"🛍 Магазин желаний\nВаш баланс: {points} 💎\n\nВыберите купон:"
+    
+    rows = []
+    if coupons:
+        for coupon in coupons:
+            rows.append([InlineKeyboardButton(
+                text=f"{coupon.title} ({coupon.cost} 💎)",
+                callback_data=f"buy_coupon:{coupon.id}"
+            )])
+    else:
+        text += "\n(Купонов пока нет)"
+
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+@router.callback_query(F.data.startswith("buy_coupon:"))
+async def buy_coupon_callback(callback: CallbackQuery):
+    coupon_id = int(callback.data.split(":")[1])
+    
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(select(User).where(User.tg_user_id == callback.from_user.id))
+        coupon = await session.get(Coupon, coupon_id)
+        
+        if not coupon or not coupon.active:
+            await callback.answer("Купон недоступен.")
+            return
+        
+        if (user.points or 0) < coupon.cost:
+            await callback.answer("Недостаточно баллов.", show_alert=True)
+            return
+        
+        # Deduct points
+        user.points -= coupon.cost
+        
+        # Give coupon
+        user_coupon = UserCoupon(user_id=user.id, coupon_id=coupon.id)
+        session.add(user_coupon)
+        await session.commit()
+        
+        coupon_title = coupon.title
+
+    await callback.answer("Куплено!", show_alert=True)
+    await callback.message.edit_text(f"Вы купили купон: {coupon_title}! 🎉\nНайти его можно в меню '🎒 Мои купоны'.")
+    
+    # Notify Admin
+    await callback.message.bot.send_message(
+        ADMIN_TG_ID,
+        f"💰 Пользователь купил купон: {coupon_title} ({coupon.cost} баллов)."
+    )
+
+
+@router.message(F.text == "🎒 Мои купоны")
+async def my_coupons_list(message: Message):
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(select(User).where(User.tg_user_id == message.from_user.id))
+        items = (await session.scalars(
+            select(UserCoupon)
+            .where(UserCoupon.user_id == user.id)
+            .where(UserCoupon.status == "active")
+            .order_by(UserCoupon.created_at.desc())
+        )).all()
+        
+        # Need to fetch titles, simple way loop or join
+        # For simplicity, let's just do a join if needed, or lazy load if configured. 
+        # But async lazy load is tricky. Let's do a join query.
+        result = await session.execute(
+            select(UserCoupon, Coupon)
+            .join(Coupon, UserCoupon.coupon_id == Coupon.id)
+            .where(UserCoupon.user_id == user.id)
+            .where(UserCoupon.status == "active")
+            .order_by(UserCoupon.created_at.desc())
+        )
+        coupons = result.all()
+
+    if not coupons:
+        await message.answer("У вас нет активных купонов.")
+        return
+
+    text = "🎒 Ваши активные купоны:"
+    rows = []
+    for uc, c in coupons:
+        rows.append([InlineKeyboardButton(
+            text=f"Использовать: {c.title}",
+            callback_data=f"use_coupon:{uc.id}"
+        )])
+
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("use_coupon:"))
+async def use_coupon_callback(callback: CallbackQuery):
+    uc_id = int(callback.data.split(":")[1])
+    
+    async with AsyncSessionLocal() as session:
+        uc = await session.get(UserCoupon, uc_id)
+        if not uc or uc.status != "active":
+            await callback.answer("Купон уже использован или недействителен.")
+            await clear_inline_keyboard(callback.message)
+            return
+        
+        # Verify user owns it
+        user = await session.scalar(select(User).where(User.tg_user_id == callback.from_user.id))
+        if uc.user_id != user.id:
+             await callback.answer("Ошибка доступа.")
+             return
+
+        coupon = await session.get(Coupon, uc.coupon_id)
+        coupon_title = coupon.title if coupon else "Купон"
+
+        uc.status = "used"
+        uc.redeemed_at = datetime.utcnow()
+        await session.commit()
+
+    await callback.answer("Купон использован!", show_alert=True)
+    await callback.message.edit_text(f"Вы использовали купон: {coupon_title}. \nАдмин уведомлен.")
+    
+    await callback.message.bot.send_message(
+        ADMIN_TG_ID,
+        f"🎫 Пользователь ИСПОЛЬЗОВАЛ купон: {coupon_title}!"
+    )
+
+ADMIN_PENDING_COUPON = {}
+
+@router.message(F.text.startswith("/add_coupon"))
+async def add_coupon_start(message: Message):
+    # /add_coupon Title | Cost
+    if message.from_user.id != ADMIN_TG_ID:
+        return
+    
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+         await message.answer("Формат: /add_coupon Название | Стоимость")
+         return
+         
+    content = parts[1]
+    if "|" not in content:
+         await message.answer("Разделите название и цену символом |")
+         return
+         
+    title, cost_str = content.split("|", 1)
+    try:
+        cost = int(cost_str.strip())
+    except ValueError:
+        await message.answer("Цена должна быть числом.")
+        return
+        
+    async with AsyncSessionLocal() as session:
+        session.add(Coupon(title=title.strip(), cost=cost))
+        await session.commit()
+    
+    await message.answer(f"Купон '{title.strip()}' за {cost} баллов создан.")
+
+
+@router.callback_query(F.data.startswith("compliment:"))
+async def compliment_callback(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_TG_ID:
+        await callback.answer("Недоступно.")
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) < 2:
+        await callback.answer("Ошибка данных.")
+        return
+
+    action = parts[1]
+    if action == "next":
+        async with AsyncSessionLocal() as session:
+            messages = (await session.scalars(
+                select(ScheduleMessage)
+                .order_by(func.random())
+                .limit(COMPLIMENT_PAGE_SIZE)
+            )).all()
+        if not messages:
+            await callback.answer("В базе нет сообщений.")
+            return
+        try:
+            await callback.message.edit_text(
+                "Выбери комплимент для отправки:",
+                reply_markup=compliments_keyboard(messages),
+            )
+        except Exception:
+            await callback.message.answer(
+                "Выбери комплимент для отправки:",
+                reply_markup=compliments_keyboard(messages),
+            )
+        await callback.answer()
+        return
+
+    if action != "send" or len(parts) != 3:
+        await callback.answer("Ошибка данных.")
+        return
+
+    try:
+        msg_id = int(parts[2])
+    except ValueError:
+        await callback.answer("Ошибка данных.")
+        return
+
+    async with AsyncSessionLocal() as session:
+        msg = await session.get(ScheduleMessage, msg_id)
+    if not msg or not msg.text:
+        await callback.answer("Сообщение не найдено.")
+        return
+
+    delivered, total = await send_text_to_users(callback.message.bot, msg.text)
+    await callback.message.answer(
+        f"Отправлено: {delivered} из {total} пользователей."
+    )
+    await callback.answer("Готово.")
+
+@router.message(F.text == "Написать пользователю")
+async def ask_user_id_for_message(message: Message):
+    if message.from_user.id != ADMIN_TG_ID:
+        return
+    ADMIN_PENDING_MESSAGE_USER_ID[message.from_user.id] = None
+    await message.answer("Введите ID пользователя (TG Chat ID) или перешлите сообщение от него.")
+
+@router.message(lambda m: m.from_user.id == ADMIN_TG_ID and m.from_user.id in ADMIN_PENDING_MESSAGE_USER_ID and ADMIN_PENDING_MESSAGE_USER_ID[m.from_user.id] is None)
+async def receive_user_id_for_message(message: Message):
+    target_id = None
+    if message.forward_from:
+        target_id = message.forward_from.id
+    elif message.text and message.text.isdigit():
+        target_id = int(message.text)
+    
+    if target_id:
+        ADMIN_PENDING_MESSAGE_USER_ID[message.from_user.id] = target_id
+        await message.answer(f"ID {target_id} принят. Введите сообщение для отправки (текст/фото/видео/стикер).")
+    else:
+        ADMIN_PENDING_MESSAGE_USER_ID.pop(message.from_user.id, None)
+        await message.answer("Некорректный ID. Отмена.")
+
+@router.message(lambda m: m.from_user.id == ADMIN_TG_ID and m.from_user.id in ADMIN_PENDING_MESSAGE_USER_ID and ADMIN_PENDING_MESSAGE_USER_ID[m.from_user.id] is not None)
+async def send_message_to_user(message: Message):
+    target_id = ADMIN_PENDING_MESSAGE_USER_ID.pop(message.from_user.id)
+    try:
+        if message.sticker:
+            await message.bot.send_sticker(target_id, message.sticker.file_id)
+        elif message.photo:
+            await message.bot.send_photo(target_id, message.photo[-1].file_id, caption=message.caption)
+        elif message.video:
+            await message.bot.send_video(target_id, message.video.file_id, caption=message.caption)
+        elif message.voice:
+            await message.bot.send_voice(target_id, message.voice.file_id, caption=message.caption)
+        elif message.text:
+            await message.bot.send_message(target_id, message.text)
+        else:
+             await message.bot.send_message(target_id, "Сообщение (формат не поддерживается).")
+        
+        await message.answer("Сообщение отправлено.")
+    except Exception as e:
+        await message.answer(f"Ошибка отправки: {e}")
+
+    await callback.answer()
+
+
+@router.message(F.text == "/test_schedule")
+async def test_schedule(message: Message):
+    if message.from_user.id != ADMIN_TG_ID:
+        return
+
+    await send_random_to_users(message.bot, message.chat.id)
+
+
+
+
+# --- Valentine's Season Handlers ---
+
+@router.message(F.text == "💘 14 Февраля")
+async def valentine_menu(message: Message):
+    now = datetime.now()
+    if not (now.month == 2 and 11 <= now.day <= 14):
+        await message.answer("Сезон уже прошел! 🥀", reply_markup=user_reply_keyboard())
+        return
+    await message.answer(
+        "💘 **Сезон Любви**\n\nВыполняйте задания, получайте предсказания и копите баллы!", 
+        reply_markup=valentine_reply_keyboard(),
+        parse_mode="Markdown"
+    )
+
+@router.message(F.text == "🔙 Назад")
+async def back_to_main(message: Message):
+    await message.answer("Главное меню", reply_markup=user_reply_keyboard())
+
+@router.message(F.text == "💌 Задание дня")
+async def valentine_quest(message: Message):
+    now = datetime.now()
+    day = now.day
+    
+    quests = {
+        11: "💌 **День 1: Воспоминания**\nНайди ваше самое первое совместное фото и отправь его мне (боту)!",
+        12: "📸 **День 2: Селфи**\nСделай милое селфи прямо сейчас и отправь его!",
+        13: "📝 **День 3: 3 Причины**\nНапиши 3 причины, почему ты его/ее любишь. Отправь текстом.",
+        14: "🎁 **День 4: Финал**\nСегодня 14 февраля! Сделай сюрприз (ужин, подарок, массаж) и пришли фото-отчет!"
+    }
+    
+    text = quests.get(day, "На сегодня заданий нет. Отдыхай! 💕")
+    await message.answer(text, parse_mode="Markdown")
+
+@router.message(F.text == "📤 Отчет по заданию")
+async def start_valentine_proof_submission(message: Message, state: FSMContext):
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(select(User).where(User.tg_user_id == message.from_user.id))
+        if not user:
+            return
+
+        # Check for existing submissions today
+        today = datetime.now().date()
+        stmt = select(InboxMessage).where(
+            InboxMessage.user_id == user.id,
+            InboxMessage.action_status.in_(["approved_val", "pending"]), # Check approved or pending
+            func.date(InboxMessage.created_at) == today
+        )
+        existing = await session.scalar(stmt)
+        
+        if existing:
+            if existing.action_status == "approved_val":
+                await message.answer("Ты уже выполнила задание сегодня! Умничка! Заходи завтра. 😘")
+            else:
+                await message.answer("Твой отчет за сегодня уже на проверке! Жди вердикт. ⏳")
+            return
+
+    await state.set_state(UserStates.waiting_for_valentine_proof)
+    await message.answer("Пришли фото или текст с выполненным заданием 14 февраля! ❤️")
+
+@router.message(F.text == "🔮 Предсказание")
+async def valentine_prediction(message: Message):
+    predictions = [
+        "Твоя улыбка сегодня растопит чье-то сердце! ❤️",
+        "Жди приятный сюрприз вечером! 🎁",
+        "Любовь витает в воздухе... Вдохни поглубже! 🌬️❤️",
+        "Ты — самое дорогое, что у него есть! 💎",
+        "Сегодня идеальный день для обнимашек! 🤗",
+        "Твои глаза сияют ярче звезд! ✨",
+    ]
+    await message.answer(f"🔮 {random.choice(predictions)}")
+
+
+@router.message(F.text.in_({"/broadcast", "📢 Рассылка"}))
+async def broadcast_start(message: Message):
+    if message.from_user.id != ADMIN_TG_ID:
+        return
+    ADMIN_PENDING_BROADCAST[message.from_user.id] = None
+    await message.answer("📢 Введите сообщение для рассылки всем пользователям (текст/фото/видео).")
+
+
+@router.message(lambda m: m.from_user.id == ADMIN_TG_ID and m.from_user.id in ADMIN_PENDING_BROADCAST and ADMIN_PENDING_BROADCAST[m.from_user.id] is None)
+async def broadcast_content(message: Message):
+    content_text = message.text or message.caption
+    media_type = None
+    media_file_id = None
+    
+    if message.sticker:
+        media_type = "sticker"
+        media_file_id = message.sticker.file_id
+    elif message.photo:
+        media_type = "photo"
+        media_file_id = message.photo[-1].file_id
+    elif message.video:
+        media_type = "video"
+        media_file_id = message.video.file_id
+    elif message.voice:
+        media_type = "voice"
+        media_file_id = message.voice.file_id
+        
+    ADMIN_PENDING_BROADCAST[message.from_user.id] = {
+        "text": content_text,
+        "media_type": media_type,
+        "media_file_id": media_file_id
+    }
+    
+    # Preview
+    await message.answer("Предпросмотр:")
+    try:
+        if media_type == "sticker":
+            await message.bot.send_sticker(message.chat.id, media_file_id)
+        elif media_type == "photo":
+            await message.bot.send_photo(message.chat.id, media_file_id, caption=content_text)
+        elif media_type == "video":
+            await message.bot.send_video(message.chat.id, media_file_id, caption=content_text)
+        elif media_type == "voice":
+            await message.bot.send_voice(message.chat.id, media_file_id, caption=content_text)
+        else:
+             await message.answer(content_text or "[Пустое сообщение?]")
+    except Exception as e:
+        await message.answer(f"Ошибка предпросмотра: {e}")
+        
+    await message.answer(
+        "Отправить всем пользователям?",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="✅ Отправить"), KeyboardButton(text="❌ Отмена")]
+            ],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+    )
+
+@router.message(lambda m: m.from_user.id == ADMIN_TG_ID and m.from_user.id in ADMIN_PENDING_BROADCAST and m.text in ("✅ Отправить", "❌ Отмена"))
+async def broadcast_confirm(message: Message):
+    if message.text == "❌ Отмена":
+        ADMIN_PENDING_BROADCAST.pop(message.from_user.id)
+        await message.answer("Рассылка отменена.", reply_markup=admin_reply_keyboard())
+        return
+
+    data = ADMIN_PENDING_BROADCAST.pop(message.from_user.id)
+    
+    async with AsyncSessionLocal() as session:
+        users = (await session.scalars(select(User))).all()
+        
+    sent_count = 0
+    errors = 0
+    
+    status_msg = await message.answer(f"Начинаю рассылку на {len(users)} пользователей...")
+    
+    for user in users:
+        try:
+            if data["media_type"] == "sticker":
+                await message.bot.send_sticker(user.tg_chat_id, data["media_file_id"])
+            elif data["media_type"] == "photo":
+                await message.bot.send_photo(user.tg_chat_id, data["media_file_id"], caption=data["text"])
+            elif data["media_type"] == "video":
+                await message.bot.send_video(user.tg_chat_id, data["media_file_id"], caption=data["text"])
+            elif data["media_type"] == "voice":
+                await message.bot.send_voice(user.tg_chat_id, data["media_file_id"], caption=data["text"])
+            else:
+                await message.bot.send_message(user.tg_chat_id, data["text"])
+            sent_count += 1
+        except Exception:
+            errors += 1
+            
+    await status_msg.delete()
+    await message.answer(
+        f"✅ Рассылка завершена.\nОтправлено: {sent_count}\nОшибок: {errors}", 
+        reply_markup=admin_reply_keyboard()
+    )
+
+
+@router.message(F.text == "📤 Отправить отчет")
+async def start_proof_submission(message: Message, state: FSMContext):
+    await state.set_state(UserStates.waiting_for_proof)
+    await message.answer("Пожалуйста, отправь фото, видео или кружок сейчас. Это будет считаться отчетом для продления подписки.")
+
 @router.message()
-async def inbox(message: Message):
+async def inbox(message: Message, state: FSMContext):
     if message.from_user.id == ADMIN_TG_ID and message.from_user.id in ADMIN_PENDING_COMPLIMENT:
         text = extract_text(message).strip()
         if not text:
@@ -779,7 +1480,20 @@ async def inbox(message: Message):
 
         text = extract_text(message)
         media_type, media_file_id = extract_media(message)
-        has_proof = has_proof_media(message)
+        
+        current_state = await state.get_state()
+        is_proof_mode = current_state == UserStates.waiting_for_proof.state
+        is_val_proof = current_state == UserStates.waiting_for_valentine_proof.state
+        
+        has_proof = has_proof_media(message) and is_proof_mode
+        
+        # Valentine proof handling (text or media)
+        if is_val_proof:
+            has_proof = True # treat everything as proof in this mode
+            
+        if has_proof or is_val_proof:
+            await state.clear()
+            
         now = datetime.utcnow()
         inbox = InboxMessage(
             user_id=user.id,
@@ -787,17 +1501,37 @@ async def inbox(message: Message):
             text=text,
             media_type=media_type,
             media_file_id=media_file_id,
-            action_status="pending" if has_proof else None,
+            # For val proof, we use a special status or just rely on the admin keyboard logic
+            # Let's use "val_pending" to distinguish if needed, or just "pending" and context from admin message
+            action_status="pending", 
             raw=message.model_dump_json()
         )
         session.add(inbox)
         user.last_activity_at = now
+        await session.flush() # get ID
+        
+        if is_val_proof:
+            caption = f"💘 Отчет 14 февраля:\n{text or '[Медиа]'}"
+            reply_markup = valentine_admin_keyboard(inbox.id)
+            if media_type == "photo":
+                await message.bot.send_photo(ADMIN_TG_ID, media_file_id, caption=caption, reply_markup=reply_markup)
+            elif media_type == "video":
+                await message.bot.send_video(ADMIN_TG_ID, media_file_id, caption=caption, reply_markup=reply_markup)
+            elif media_type == "video_note":
+                await message.bot.send_video_note(ADMIN_TG_ID, media_file_id, reply_markup=reply_markup)
+            elif media_type == "voice":
+                await message.bot.send_voice(ADMIN_TG_ID, media_file_id, caption=caption, reply_markup=reply_markup)
+            else:
+                await message.bot.send_message(ADMIN_TG_ID, caption, reply_markup=reply_markup)
+                
+            await message.answer("Отчет отправлен купидону (админу)! Жди вердикт. 🏹")
+            await session.commit()
+            return
 
         rules = []
-        if has_proof:
+        if has_proof and not is_val_proof:
             rules = await get_active_rules(session)
 
-        await session.flush()
         await session.commit()
 
     # уведомляем админа и даем кнопки выбора правила
@@ -838,10 +1572,25 @@ async def inbox(message: Message):
         else:
             await message.answer("Спасибо! Я передал доказательства на проверку.")
     else:
-        await message.bot.send_message(
-            ADMIN_TG_ID,
-            f"Сообщение от неё:\n{text or '[медиа]'}"
-        )
+        if media_type and media_file_id:
+            if media_type == "photo":
+                await message.bot.send_photo(ADMIN_TG_ID, media_file_id, caption=text or None)
+            elif media_type == "video":
+                await message.bot.send_video(ADMIN_TG_ID, media_file_id, caption=text or None)
+            elif media_type == "video_note":
+                await message.bot.send_video_note(ADMIN_TG_ID, media_file_id)
+            elif media_type == "voice":
+                await message.bot.send_voice(ADMIN_TG_ID, media_file_id, caption=text or None)
+            else:
+                await message.bot.send_message(
+                    ADMIN_TG_ID,
+                    f"Сообщение от неё:\n{text or '[медиа]'}"
+                )
+        else:
+            await message.bot.send_message(
+                ADMIN_TG_ID,
+                f"Сообщение от неё:\n{text or '[медиа]'}"
+            )
 
 
 async def apply_action_for_inbox(inbox_id: int, rule_id: int):
@@ -999,14 +1748,20 @@ async def action_admin_callback(callback: CallbackQuery):
             await callback.answer("Не удалось применить действие.")
             return
 
+        # Award points
+        user_model = await session.get(User, inbox.user_id)
+        if user_model:
+            user_model.points = (user_model.points or 0) + 10
+            await session.commit()
+
         await clear_inline_keyboard(callback.message)
-        await callback.answer("Продлено.")
+        await callback.answer("Продлено +10 баллов.")
         new_txt = new_expires.strftime("%Y-%m-%d %H:%M")
-        await callback.message.answer(f"Подписка продлена до {new_txt}.")
+        await callback.message.answer(f"Подписка продлена до {new_txt}. Начислено 10 баллов.")
         if user_chat_id:
             await callback.message.bot.send_message(
                 user_chat_id,
-                f"Подписка продлена до {new_txt}. Спасибо за действие: {rule_title}!"
+                f"Подписка продлена до {new_txt}. Спасибо за действие: {rule_title}!\nВам начислено 10 баллов! 🎉"
             )
     elif action == "deny":
         if len(parts) != 3:
@@ -1038,135 +1793,52 @@ async def action_admin_callback(callback: CallbackQuery):
         return
 
 
-
-
-@router.callback_query(F.data.startswith("admin:"))
-async def admin_menu_callback(callback: CallbackQuery):
+@router.callback_query(F.data.startswith("val_quest:"))
+async def val_quest_callback(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_TG_ID:
-        await callback.answer("Недоступно.")
         return
-
-    action = callback.data.split(":", 1)[1]
-    if action == "menu":
-        await callback.message.answer("Меню админа:", reply_markup=admin_menu_keyboard())
-    elif action == "rules":
-        await rules(callback.message)
-    elif action == "subscription":
-        await send_admin_status(callback.message.bot, callback.message.chat.id)
-    elif action == "status":
-        await send_admin_status(callback.message.bot, callback.message.chat.id)
-    elif action == "user":
-        await send_admin_user(callback.message.bot, callback.message.chat.id)
-    elif action == "inbox":
-        await callback.message.answer("Раздел «Последние сообщения» отключен.")
-    elif action == "proofs":
-        await send_admin_proofs(callback.message.bot, callback.message.chat.id)
-    elif action in ("next", "outbox"):
-        await send_admin_next_message(callback.message.bot, callback.message.chat.id)
-    elif action == "edit_next":
-        ADMIN_PENDING_TOMORROW.add(callback.from_user.id)
-        await callback.message.answer("Пришли новый текст для завтрашнего сообщения. Отмена: /cancel_tomorrow")
-    elif action == "schedule":
-        await send_admin_schedule(callback.message.bot, callback.message.chat.id)
-    elif action == "send_daily":
-        await send_daily(callback.message.bot)
-        await callback.message.answer("Попытался отправить дневное сообщение.")
-    elif action == "schedule_status":
-        await schedule_status(callback.message)
-    elif action == "compliment_by_number":
-        ADMIN_PENDING_COMPLIMENT.add(callback.from_user.id)
-        await callback.message.answer(
-            "Пришли номер дня или id сообщения (например: 25 или id=123). Отмена: /cancel_compliment"
-        )
-    elif action == "reset":
-        await callback.message.answer("Сброс дат отключен.")
-    elif action in ("random", "test"):
-        await send_random_to_users(callback.message.bot, callback.message.chat.id)
-    elif action == "compliment":
-        await pick_compliment(callback.message)
-    else:
-        await callback.answer("Неизвестно.")
-        return
-
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("compliment:"))
-async def compliment_callback(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_TG_ID:
-        await callback.answer("Недоступно.")
-        return
-
+        
     parts = callback.data.split(":")
-    if len(parts) < 2:
-        await callback.answer("Ошибка данных.")
-        return
-
     action = parts[1]
-    if action == "next":
-        async with AsyncSessionLocal() as session:
-            messages = (await session.scalars(
-                select(ScheduleMessage)
-                .order_by(func.random())
-                .limit(COMPLIMENT_PAGE_SIZE)
-            )).all()
-        if not messages:
-            await callback.answer("В базе нет сообщений.")
-            return
-        try:
-            await callback.message.edit_text(
-                "Выбери комплимент для отправки:",
-                reply_markup=compliments_keyboard(messages),
-            )
-        except Exception:
-            await callback.message.answer(
-                "Выбери комплимент для отправки:",
-                reply_markup=compliments_keyboard(messages),
-            )
-        await callback.answer()
-        return
-
-    if action != "send" or len(parts) != 3:
-        await callback.answer("Ошибка данных.")
-        return
-
-    try:
-        msg_id = int(parts[2])
-    except ValueError:
-        await callback.answer("Ошибка данных.")
-        return
-
+    inbox_id = int(parts[2])
+    
     async with AsyncSessionLocal() as session:
-        msg = await session.get(ScheduleMessage, msg_id)
-    if not msg or not msg.text:
-        await callback.answer("Сообщение не найдено.")
-        return
+        inbox = await session.get(InboxMessage, inbox_id)
+        if not inbox:
+            await callback.answer("Не найдено")
+            return
+            
+        user = await session.get(User, inbox.user_id)
+        if not user:
+            await callback.answer("Пользователь не найден")
+            return
+            
+        if action == "approve":
+            user.points = (user.points or 0) + 5
+            inbox.action_status = "approved_val"
+            await session.commit()
+            
+            await callback.answer("Принято! +5 баллов")
+            await clear_inline_keyboard(callback.message)
+            await callback.message.answer(f"✅ Задание принято. Начислено 5 баллов.")
+            
+            await callback.message.bot.send_message(
+                user.tg_chat_id,
+                "💘 Твой отчет принят! Тебе начислено +5 баллов! Ты умничка! 😘"
+            )
+        elif action == "deny":
+            inbox.action_status = "denied_val"
+            await session.commit()
+            
+            await callback.answer("Отклонено")
+            await clear_inline_keyboard(callback.message)
+            await callback.message.answer("⛔️ Задание отклонено.")
+            
+            await callback.message.bot.send_message(
+                user.tg_chat_id,
+                "💔 Твой отчет по заданию отклонен. Попробуй еще раз или уточни у админа."
+            )
 
-    delivered, total = await send_text_to_users(callback.message.bot, msg.text)
-    await callback.message.answer(
-        f"Отправлено: {delivered} из {total} пользователей."
-    )
-    await callback.answer("Готово.")
-
-@router.callback_query(F.data.startswith("user:"))
-async def user_menu_callback(callback: CallbackQuery):
-    action = callback.data.split(":", 1)[1]
-    if action == "rules":
-        await rules(callback.message)
-    elif action == "status":
-        text = await get_user_status_text(callback.from_user.id)
-        await callback.message.answer(text)
-    elif action == "menu":
-        await callback.message.answer("Пользовательское меню:", reply_markup=user_menu_inline_keyboard())
-    else:
-        await callback.answer("Неизвестно.")
-        return
-
-    await callback.answer()
 
 
-@router.message(F.text == "/test_schedule")
-async def test_schedule(message: Message):
-    if message.from_user.id != ADMIN_TG_ID:
-        return
 
-    await send_random_to_users(message.bot, message.chat.id)

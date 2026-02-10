@@ -19,7 +19,7 @@ celery_app = Celery(
 )
 
 celery_app.conf.timezone = TIMEZONE
-celery_app.conf.enable_utc = False
+celery_app.conf.enable_utc = True
 celery_app.conf.broker_connection_retry_on_startup = True
 celery_app.conf.worker_prefetch_multiplier = 1
 celery_app.conf.task_acks_late = True
@@ -39,3 +39,16 @@ if ENABLE_SCHEDULES:
             "schedule": crontab(hour=REMINDER_HOUR, minute=REMINDER_MINUTE),
         },
     }
+
+from celery.signals import task_failure
+from app.utils import send_alert
+
+@task_failure.connect
+def handle_task_failure(sender=None, exception=None, traceback=None, **kwargs):
+    if sender:
+        task_name = sender.name
+    else:
+        task_name = "unknown_task"
+    
+    alert_text = f"Celery Task Failed: {task_name}\nError: {exception}\n\n{traceback}"
+    send_alert(alert_text)

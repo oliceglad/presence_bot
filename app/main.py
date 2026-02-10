@@ -6,6 +6,18 @@ import redis
 from aiogram import Bot, Dispatcher
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pytz import timezone
+
+from app.utils import TelegramAlertHandler
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        TelegramAlertHandler()
+    ]
+)
+
 from app.config import (
     BOT_TOKEN,
     SEND_HOUR,
