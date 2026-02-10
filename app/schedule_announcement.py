@@ -14,7 +14,7 @@ TEXT = """Привет! 💖
 Заходи скорее и нажимай "💘 14 Февраля"! С праздником! 🥰"""
 
 # Image path (inside container)
-IMAGE_PATH = "/app/banner_val.png"
+IMAGE_PATH = "/app/app/banner_val.png"
 
 # Target time: Feb 11, 10:00 MSK (UTC+3) -> 07:00 UTC
 # Alternatively, if server is UTC, we target 07:00 UTC.
