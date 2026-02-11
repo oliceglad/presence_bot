@@ -1606,6 +1606,9 @@ async def inbox(message: Message, state: FSMContext):
         
         has_proof = has_proof_media(message) and is_proof_mode
         
+        
+        now = datetime.utcnow()
+
         # Valentine proof handling (text or media)
         if is_val_proof:
             has_proof = True # treat everything as proof in this mode
@@ -1621,7 +1624,6 @@ async def inbox(message: Message, state: FSMContext):
         if has_proof or is_val_proof:
             await state.clear()
             
-        now = datetime.utcnow()
         inbox = InboxMessage(
             user_id=user.id,
             tg_message_id=message.message_id,
