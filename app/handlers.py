@@ -56,6 +56,7 @@ ADMIN_PENDING_TOMORROW = set()
 ADMIN_PENDING_COMPLIMENT = set()
 ADMIN_PENDING_BROADCAST = {} # admin_id -> {text, media_type, media_file_id}
 ADMIN_PENDING_MESSAGE_USER_ID = {} # admin_id -> target_user_id
+ADMIN_PENDING_POINTS = {} # admin_id -> {step: 'user_id'|'amount', user_id: int, amount: int}
 COMPLIMENT_PAGE_SIZE = 10
 COMPLIMENT_BUTTON_MAX = 48
 
@@ -81,6 +82,7 @@ def admin_reply_keyboard():
             [KeyboardButton(text="Все 365 сообщений"), KeyboardButton(text="Сообщение на завтра")],
             [KeyboardButton(text="Изменить на завтра"), KeyboardButton(text="Отправить сегодня")],
             [KeyboardButton(text="Написать пользователю"), KeyboardButton(text="📢 Рассылка")],
+            [KeyboardButton(text="💰 Начислить баллы")],
         ],
         resize_keyboard=True
     )
@@ -1250,7 +1252,7 @@ async def send_message_to_user(message: Message):
     except Exception as e:
         await message.answer(f"Ошибка отправки: {e}")
 
-    await callback.answer()
+
 
 
 @router.message(F.text == "/test_schedule")
@@ -1315,9 +1317,11 @@ async def start_valentine_proof_submission(message: Message, state: FSMContext):
         if existing:
             if existing.action_status == "approved_val":
                 await message.answer("Ты уже выполнила задание сегодня! Умничка! Заходи завтра. 😘")
+                return
             else:
-                await message.answer("Твой отчет за сегодня уже на проверке! Жди вердикт. ⏳")
-            return
+                 # Allow multiple pending submissions in case user wants to change proof
+                 # await message.answer("Твой отчет за сегодня уже на проверке! Жди вердикт. ⏳")
+                 pass
 
     await state.set_state(UserStates.waiting_for_valentine_proof)
     await message.answer("Пришли фото или текст с выполненным заданием 14 февраля! ❤️")
@@ -1435,6 +1439,100 @@ async def broadcast_confirm(message: Message):
     )
 
 
+@router.message(F.text.startswith("/add_points"))
+async def add_points_command(message: Message):
+    if message.from_user.id != ADMIN_TG_ID:
+        return
+    
+    parts = message.text.split()
+    # Usage: /add_points <user_id> <amount>
+    # If used as reply, user_id can be omitted: /add_points <amount>
+    
+    target_id = None
+    amount = 0
+    
+    if message.reply_to_message:
+        # Try to find user from reply
+        pass 
+        # Actually it's hard to get DB user id from reply unless we parse it or have it.
+        # But we can try to guess or use the argument if provided.
+    
+    # Simpler logic: expect arguments
+    if len(parts) < 3:
+        await message.answer("Формат: /add_points <user_id> <amount>\nUser ID - это внутренний ID базы (не TG ID), можно узнать через 'Пользователь'.")
+        return
+        
+    try:
+        target_id = int(parts[1])
+        amount = int(parts[2])
+    except ValueError:
+        await message.answer("ID и сумма должны быть числами.")
+        return
+        
+    async with AsyncSessionLocal() as session:
+        user = await session.get(User, target_id)
+        if not user:
+            await message.answer(f"Пользователь с ID {target_id} не найден.")
+            return
+            
+        user.points = (user.points or 0) + amount
+        await session.commit()
+        
+        await message.answer(f"✅ Баланс пользователя {target_id} обновлен.\nБыло: {user.points - amount}\nСтало: {user.points}")
+        
+        try:
+            await message.bot.send_message(user.tg_chat_id, f"🎉 Вам начислено {amount} баллов вручную админом! Ваш баланс: {user.points}")
+        except Exception:
+            await message.answer("Не удалось уведомить пользователя (блок бота?).")
+
+
+@router.message(F.text == "💰 Начислить баллы")
+async def add_points_ui_start(message: Message):
+    if message.from_user.id != ADMIN_TG_ID:
+        return
+    ADMIN_PENDING_POINTS[message.from_user.id] = {"step": "user_id"}
+    await message.answer("Введите внутренний ID пользователя (можно узнать кнопкой 'Пользователь' или в БД).")
+
+@router.message(lambda m: m.from_user.id == ADMIN_TG_ID and m.from_user.id in ADMIN_PENDING_POINTS and ADMIN_PENDING_POINTS[m.from_user.id]["step"] == "user_id")
+async def add_points_ui_user_id(message: Message):
+    try:
+        user_id = int(message.text)
+    except ValueError:
+        await message.answer("Нужен числовой ID. Отмена: /cancel")
+        return
+
+    ADMIN_PENDING_POINTS[message.from_user.id]["user_id"] = user_id
+    ADMIN_PENDING_POINTS[message.from_user.id]["step"] = "amount"
+    await message.answer(f"ID {user_id} принят. Введите сумму баллов для начисления:")
+
+@router.message(lambda m: m.from_user.id == ADMIN_TG_ID and m.from_user.id in ADMIN_PENDING_POINTS and ADMIN_PENDING_POINTS[m.from_user.id]["step"] == "amount")
+async def add_points_ui_amount(message: Message):
+    try:
+        amount = int(message.text)
+    except ValueError:
+        await message.answer("Нужно число. Отмена: /cancel")
+        return
+
+    data = ADMIN_PENDING_POINTS.pop(message.from_user.id)
+    user_id = data["user_id"]
+
+    async with AsyncSessionLocal() as session:
+        user = await session.get(User, user_id)
+        if not user:
+            await message.answer(f"Пользователь {user_id} не найден.")
+            return
+        
+        user.points = (user.points or 0) + amount
+        await session.commit()
+        
+        await message.answer(f"✅ Успешно! Пользователю {user_id} начислено {amount} баллов. Баланс: {user.points}")
+        
+        try:
+            await message.bot.send_message(user.tg_chat_id, f"🎉 Вам начислено {amount} баллов вручную админом! Ваш баланс: {user.points}")
+        except Exception:
+            await message.answer("Не удалось уведомить пользователя.")
+
+
 @router.message(F.text == "📤 Отправить отчет")
 async def start_proof_submission(message: Message, state: FSMContext):
     await state.set_state(UserStates.waiting_for_proof)
@@ -1490,6 +1588,14 @@ async def inbox(message: Message, state: FSMContext):
         # Valentine proof handling (text or media)
         if is_val_proof:
             has_proof = True # treat everything as proof in this mode
+        
+        # Also catch implicit Valentine proofs via date if not in explicit mode but during season
+        is_valentine_season = (now.month == 2 and 11 <= now.day <= 14)
+        if is_valentine_season:
+             # If user sends media during season, treat as potential proof even if not explicitly in mode
+             if has_proof_media(message):
+                 is_val_proof = True
+
             
         if has_proof or is_val_proof:
             await state.clear()
@@ -1815,6 +1921,30 @@ async def val_quest_callback(callback: CallbackQuery):
             return
             
         if action == "approve":
+            # Check if already approved today
+            today = datetime.now().date()
+            existing_approved = await session.scalar(
+                select(InboxMessage).where(
+                    InboxMessage.user_id == user.id,
+                    InboxMessage.action_status == "approved_val",
+                    func.date(InboxMessage.created_at) == today,
+                    InboxMessage.id != inbox_id # exclude self if re-clicking
+                )
+            )
+            
+            if existing_approved:
+                # Already paid for today, just mark this one as approved/duplicate
+                inbox.action_status = "approved_val_duplicate"
+                await session.commit()
+                await callback.answer("Уже было одобрено сегодня. Баллы не начислены повторно.")
+                await clear_inline_keyboard(callback.message)
+                await callback.message.answer(f"✅ Дубликат принят (без баллов).")
+                return
+
+            if inbox.action_status == "approved_val":
+                 await callback.answer("Уже принято.")
+                 return
+
             user.points = (user.points or 0) + 5
             inbox.action_status = "approved_val"
             await session.commit()
