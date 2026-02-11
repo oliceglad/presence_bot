@@ -149,10 +149,12 @@ def extract_media(message: Message):
         return "voice", message.voice.file_id
     if message.sticker:
         return "sticker", message.sticker.file_id
+    if message.document:
+        return "document", message.document.file_id
     return None, None
 
 def has_proof_media(message: Message) -> bool:
-    return bool(message.photo or message.video or message.video_note)
+    return bool(message.photo or message.video or message.video_note or message.document)
 
 def shorten_text(text: str, max_len: int = COMPLIMENT_BUTTON_MAX) -> str:
     cleaned = " ".join((text or "").split())
@@ -1650,6 +1652,8 @@ async def inbox(message: Message, state: FSMContext):
                 await message.bot.send_video_note(ADMIN_TG_ID, media_file_id, reply_markup=reply_markup)
             elif media_type == "voice":
                 await message.bot.send_voice(ADMIN_TG_ID, media_file_id, caption=caption, reply_markup=reply_markup)
+            elif media_type == "document":
+                await message.bot.send_document(ADMIN_TG_ID, media_file_id, caption=caption, reply_markup=reply_markup)
             else:
                 await message.bot.send_message(ADMIN_TG_ID, caption, reply_markup=reply_markup)
                 
@@ -1681,10 +1685,17 @@ async def inbox(message: Message, state: FSMContext):
                 caption=caption,
                 reply_markup=admin_keyboard
             )
-        elif media_type == "video_note":
+        if media_type == "video_note":
             await message.bot.send_video_note(
                 ADMIN_TG_ID,
                 media_file_id,
+                reply_markup=admin_keyboard
+            )
+        elif media_type == "document":
+             await message.bot.send_document(
+                ADMIN_TG_ID,
+                media_file_id,
+                caption=caption,
                 reply_markup=admin_keyboard
             )
         else:
@@ -1710,6 +1721,8 @@ async def inbox(message: Message, state: FSMContext):
                 await message.bot.send_video_note(ADMIN_TG_ID, media_file_id)
             elif media_type == "voice":
                 await message.bot.send_voice(ADMIN_TG_ID, media_file_id, caption=text or None)
+            elif media_type == "document":
+                await message.bot.send_document(ADMIN_TG_ID, media_file_id, caption=text or None)
             else:
                 await message.bot.send_message(
                     ADMIN_TG_ID,
