@@ -198,6 +198,26 @@ async def get_active_rules(session):
         .order_by(ActionRule.id)
     )).all()
 
+async def get_user_smart(session, user_id_val: int):
+    # Attempt to find user by internal ID (PK) OR by Telegram User ID.
+    # Postgres INTEGER (PK) max value is ~2.14 billion.
+    # Telegram User IDs (BigInteger) can be much larger and will cause DataError if passed to session.get(User, val).
+    
+    INT32_MAX = 2_147_483_647
+    
+    # 1. If it's too large for int32, it MUST be a TG ID (or invalid PK)
+    if user_id_val > INT32_MAX:
+        return await session.scalar(select(User).where(User.tg_user_id == user_id_val))
+    
+    # 2. If it fits int32, it could be PK
+    user = await session.get(User, user_id_val)
+    if user:
+        return user
+        
+    # 3. If not found by PK, maybe it's a small TG ID (older account)?
+    return await session.scalar(select(User).where(User.tg_user_id == user_id_val))
+
+
 @router.message(F.text == "/start")
 async def start(message: Message):
     if message.from_user.id == ADMIN_TG_ID:
@@ -1470,15 +1490,15 @@ async def add_points_command(message: Message):
         return
         
     async with AsyncSessionLocal() as session:
-        user = await session.get(User, target_id)
+        user = await get_user_smart(session, target_id)
         if not user:
-            await message.answer(f"Пользователь с ID {target_id} не найден.")
+            await message.answer(f"Пользователь с ID {target_id} не найден (ни по ID, ни по TG ID).")
             return
             
         user.points = (user.points or 0) + amount
         await session.commit()
         
-        await message.answer(f"✅ Баланс пользователя {target_id} обновлен.\nБыло: {user.points - amount}\nСтало: {user.points}")
+        await message.answer(f"✅ Баланс пользователя {user.id} ({user.tg_user_id}) обновлен.\nБыло: {user.points - amount}\nСтало: {user.points}")
         
         try:
             await message.bot.send_message(user.tg_chat_id, f"🎉 Вам начислено {amount} баллов вручную админом! Ваш баланс: {user.points}")
@@ -1491,7 +1511,7 @@ async def add_points_ui_start(message: Message):
     if message.from_user.id != ADMIN_TG_ID:
         return
     ADMIN_PENDING_POINTS[message.from_user.id] = {"step": "user_id"}
-    await message.answer("Введите внутренний ID пользователя (можно узнать кнопкой 'Пользователь' или в БД).")
+    await message.answer("Введите ID пользователя (внутренний ID или Telegram User ID).")
 
 @router.message(lambda m: m.from_user.id == ADMIN_TG_ID and m.from_user.id in ADMIN_PENDING_POINTS and ADMIN_PENDING_POINTS[m.from_user.id]["step"] == "user_id")
 async def add_points_ui_user_id(message: Message):
@@ -1514,18 +1534,19 @@ async def add_points_ui_amount(message: Message):
         return
 
     data = ADMIN_PENDING_POINTS.pop(message.from_user.id)
-    user_id = data["user_id"]
+    user_id_input = data["user_id"]
 
     async with AsyncSessionLocal() as session:
-        user = await session.get(User, user_id)
+        user = await get_user_smart(session, user_id_input)
+        
         if not user:
-            await message.answer(f"Пользователь {user_id} не найден.")
+            await message.answer(f"Пользователь {user_id_input} не найден (ни по ID, ни по TG ID).")
             return
         
         user.points = (user.points or 0) + amount
         await session.commit()
         
-        await message.answer(f"✅ Успешно! Пользователю {user_id} начислено {amount} баллов. Баланс: {user.points}")
+        await message.answer(f"✅ Успешно! Пользователю {user.id} ({user.tg_user_id}) начислено {amount} баллов. Баланс: {user.points}")
         
         try:
             await message.bot.send_message(user.tg_chat_id, f"🎉 Вам начислено {amount} баллов вручную админом! Ваш баланс: {user.points}")
