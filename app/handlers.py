@@ -1674,7 +1674,7 @@ async def inbox(message: Message, state: FSMContext):
             # For val proof, we use a special status or just rely on the admin keyboard logic
             # Let's use "val_pending" to distinguish if needed, or just "pending" and context from admin message
             action_status="pending", 
-            raw=message.model_dump_json()
+            raw=message.model_dump_json(exclude_none=True, exclude_unset=True)
         )
         session.add(inbox)
         user.last_activity_at = now
