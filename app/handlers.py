@@ -62,7 +62,7 @@ COMPLIMENT_BUTTON_MAX = 48
 
 class UserStates(StatesGroup):
     waiting_for_proof = State()
-    waiting_for_valentine_proof = State()
+    waiting_for_march_proof = State()
 
 TASKS = [
     "10 минут прогулки",
@@ -96,12 +96,12 @@ def user_reply_keyboard():
     
     # Valentine's Season (Feb 11 - Feb 15)
     now = datetime.now()
-    if now.month == 2 and 11 <= now.day <= 14:
-        rows.insert(0, [KeyboardButton(text="💘 14 Февраля")])
+    if now.month == 3:
+        rows.insert(0, [KeyboardButton(text="🌸 Март")])
         
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
-def valentine_reply_keyboard():
+def march_reply_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="💌 Задание дня"), KeyboardButton(text="📤 Отчет по заданию")],
@@ -110,10 +110,10 @@ def valentine_reply_keyboard():
         resize_keyboard=True
     )
 
-def valentine_admin_keyboard(inbox_id: int):
+def march_admin_keyboard(inbox_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Принять (+5 баллов)", callback_data=f"val_quest:approve:{inbox_id}")],
-        [InlineKeyboardButton(text="⛔️ Отклонить", callback_data=f"val_quest:deny:{inbox_id}")]
+        [InlineKeyboardButton(text="✅ Принять (+5 баллов)", callback_data=f"march_quest:approve:{inbox_id}")],
+        [InlineKeyboardButton(text="⛔️ Отклонить", callback_data=f"march_quest:deny:{inbox_id}")]
     ])
 
 def action_rules_keyboard(rules, inbox_id: int, prefix: str, include_deny: bool = False):
@@ -1289,15 +1289,15 @@ async def test_schedule(message: Message):
 
 # --- Valentine's Season Handlers ---
 
-@router.message(F.text == "💘 14 Февраля")
-async def valentine_menu(message: Message):
+@router.message(F.text == "🌸 Март")
+async def march_menu(message: Message):
     now = datetime.now()
-    if not (now.month == 2 and 11 <= now.day <= 14):
-        await message.answer("Сезон уже прошел! 🥀", reply_markup=user_reply_keyboard())
+    if not (now.month == 3):
+        await message.answer("Март еще не наступил или уже прошел! 🥀", reply_markup=user_reply_keyboard())
         return
     await message.answer(
-        "💘 **Сезон Любви**\n\nВыполняйте задания, получайте предсказания и копите баллы!", 
-        reply_markup=valentine_reply_keyboard(),
+        "🌸 **Весенний марафон!**\n\nВыполняйте задания, получайте предсказания и копите баллы!", 
+        reply_markup=march_reply_keyboard(),
         parse_mode="Markdown"
     )
 
@@ -1306,22 +1306,80 @@ async def back_to_main(message: Message):
     await message.answer("Главное меню", reply_markup=user_reply_keyboard())
 
 @router.message(F.text == "💌 Задание дня")
-async def valentine_quest(message: Message):
+async def march_quest_handler(message: Message):
     now = datetime.now()
     day = now.day
     
-    quests = {
-        11: "💌 **День 1: Воспоминания**\nНайди ваше самое первое совместное фото и отправь его мне (боту)!",
-        12: "📸 **День 2: Селфи**\nСделай милое селфи прямо сейчас и отправь его!",
-        13: "📝 **День 3: 3 Причины**\nНапиши 3 причины, почему ты его/ее любишь. Отправь текстом.",
-        14: "🎁 **День 4: Финал**\nСегодня 14 февраля! Сделай сюрприз (ужин, подарок, массаж) и пришли фото-отчет!"
+        quests = {
+        1: "🌸 **День 1: Начало весны**
+Сделай фото первого весеннего дня и отправь его мне!",
+        2: "🎵 **День 2: Весенний ритм**
+Пришли 3 песни, которые создают весеннее настроение.",
+        3: "☕️ **День 3: Уют**
+Выпей любимый напиток и пришли фото кружки!",
+        4: "🚶‍♀️ **День 4: Шаги**
+Пройди сегодня 5000 шагов и скинь скриншот шагомера.",
+        5: "🌿 **День 5: Природа**
+Найди что-то зеленое на улице и сфотографируй.",
+        6: "📖 **День 6: Цитата**
+Напиши мне свою самую любимую цитату.",
+        7: "👗 **День 7: Образ**
+Оденься сегодня во что-то яркое и скинь селфи в зеркале.",
+        8: "🌷 **День 8: Праздник**
+Поздравь себя с 8 марта! Скинь аудиособщение с пожеланием себе.",
+        9: "🌤 **День 9: Небо**
+Сфотографируй небо, какое оно сейчас.",
+        10: "🧘‍♀️ **День 10: Релакс**
+Удели 15 минут спокойствию. Пришли фото того, как ты отдыхаешь.",
+        11: "🎨 **День 11: Творчество**
+Нарисуй что-нибудь (хоть смайлик) на листочке и сфоткай.",
+        12: "🍽 **День 12: Вкуснотища**
+Сделай фото своего самого вкусного приема пищи за сегодня.",
+        13: "🧹 **День 13: Чистота**
+Выброси 3 ненужные вещи. Пришли фото, от чего избавилась.",
+        14: "💖 **День 14: Любовь к себе**
+Напиши 3 качества, которые ты в себе обожаешь.",
+        15: "🎬 **День 15: Кино**
+Посоветуй мне классный фильм на вечер.",
+        16: "🐈 **День 16: Животные**
+Сфоткай любого котика, собачку или птичку на улице.",
+        17: "👟 **День 17: Активность**
+Сделай 10 приседаний! Можешь скинуть кружочек (по желанию) или просто написать 'готово'.",
+        18: "💄 **День 18: Красота**
+Сделай себе красивый макияж (или уход) и скинь селфи.",
+        19: "📚 **День 19: Книги**
+Покажи, какую книгу ты сейчас читаешь (или хотела бы прочитать).",
+        20: "🌟 **День 20: Радость**
+Что сегодня заставило тебя улыбнуться? Расскажи аудиосообщением.",
+        21: "🌳 **День 21: Парк**
+Прогуляйся сегодня хотя бы 10 минут по парку или аллее. Скинь фото деревьев.",
+        22: "🥤 **День 22: Вода**
+Выпей стакан воды прямо сейчас и скинь фото стакана.",
+        23: "📸 **День 23: Воспоминания**
+Найди свое любимое летнее фото и скинь мне!",
+        24: "🎁 **День 24: Подарок себе**
+Купи себе любую приятную мелочь и покажи мне.",
+        25: "📝 **День 25: Планы**
+Напиши 3 главных плана на грядущее лето.",
+        26: "🕯 **День 26: Вечер**
+Зажги свечу или включи уютный свет. Скинь атмосферное фото.",
+        27: "🎧 **День 27: Подкаст**
+Послушай любой интересный подкаст или видео хотя бы 5 минут и напиши его название.",
+        28: "🛍 **День 28: Вишлист**
+Пришли одну вещь, которую очень хочешь купить.",
+        29: "🤸‍♀️ **День 29: Разминка**
+Потянись хорошенько! Напиши 'Потянулась', когда сделаешь.",
+        30: "💐 **День 30: Цветы**
+Купи себе цветы или найди красивые на картинке и пришли.",
+        31: "🎉 **День 31: Финал**
+Поздравляю, март пройден! Напиши, какое задание было самым классным."
     }
     
     text = quests.get(day, "На сегодня заданий нет. Отдыхай! 💕")
     await message.answer(text, parse_mode="Markdown")
 
 @router.message(F.text == "📤 Отчет по заданию")
-async def start_valentine_proof_submission(message: Message, state: FSMContext):
+async def start_march_proof_submission(message: Message, state: FSMContext):
     async with AsyncSessionLocal() as session:
         user = await session.scalar(select(User).where(User.tg_user_id == message.from_user.id))
         if not user:
@@ -1331,13 +1389,13 @@ async def start_valentine_proof_submission(message: Message, state: FSMContext):
         today = datetime.now().date()
         stmt = select(InboxMessage).where(
             InboxMessage.user_id == user.id,
-            InboxMessage.action_status.in_(["approved_val", "pending"]), # Check approved or pending
+            InboxMessage.action_status.in_(["approved_march", "pending"]), # Check approved or pending
             func.date(InboxMessage.created_at) == today
         )
         existing = await session.scalar(stmt)
         
         if existing:
-            if existing.action_status == "approved_val":
+            if existing.action_status == "approved_march":
                 await message.answer("Ты уже выполнила задание сегодня! Умничка! Заходи завтра. 😘")
                 return
             else:
@@ -1345,18 +1403,30 @@ async def start_valentine_proof_submission(message: Message, state: FSMContext):
                  # await message.answer("Твой отчет за сегодня уже на проверке! Жди вердикт. ⏳")
                  pass
 
-    await state.set_state(UserStates.waiting_for_valentine_proof)
-    await message.answer("Пришли фото или текст с выполненным заданием 14 февраля! ❤️")
+    await state.set_state(UserStates.waiting_for_march_proof)
+    await message.answer("Пришли фото или текст с выполненным заданием марта! 🌸")
 
 @router.message(F.text == "🔮 Предсказание")
-async def valentine_prediction(message: Message):
+async def march_prediction(message: Message):
     predictions = [
         "Твоя улыбка сегодня растопит чье-то сердце! ❤️",
         "Жди приятный сюрприз вечером! 🎁",
-        "Любовь витает в воздухе... Вдохни поглубже! 🌬️❤️",
+        "Весна уже здесь... Вдохни поглубже! 🌸",
         "Ты — самое дорогое, что у него есть! 💎",
         "Сегодня идеальный день для обнимашек! 🤗",
         "Твои глаза сияют ярче звезд! ✨",
+        "Скоро в твоей жизни случится что-то волшебное! 🪄",
+        "Доверься своей интуиции сегодня, она не подведет! 🌙",
+        "Впереди тебя ждут отличные новости! 💌",
+        "Сегодняшний день принесет тебе много радости! ☀️",
+        "Твоя энергия сегодня на высоте! Сверни горы! 🏔",
+        "Кто-то думает о тебе прямо сейчас с улыбкой. 😊",
+        "Разреши себе сегодня маленькую шалость! 🧁",
+        "Все, за что ты сегодня возьмешься, получится легко! 🕊",
+        "На этой неделе тебя ждет приятная встреча! ☕️",
+        "Твоему обаянию сегодня невозможно сопротивляться! 💃",
+        "Случайность сегодня обернется большой удачей! 🍀",
+        "Послушай любимую песню, в ней есть подсказка для тебя! 🎧"
     ]
     await message.answer(f"🔮 {random.choice(predictions)}")
 
@@ -1604,7 +1674,7 @@ async def inbox(message: Message, state: FSMContext):
         
         current_state = await state.get_state()
         is_proof_mode = current_state == UserStates.waiting_for_proof.state
-        is_val_proof = current_state == UserStates.waiting_for_valentine_proof.state
+        is_march_proof = current_state == UserStates.waiting_for_march_proof.state
         
         has_proof = has_proof_media(message) and is_proof_mode
         
@@ -1612,18 +1682,18 @@ async def inbox(message: Message, state: FSMContext):
         now = datetime.utcnow()
 
         # Valentine proof handling (text or media)
-        if is_val_proof:
+        if is_march_proof:
             has_proof = True # treat everything as proof in this mode
         
         # Also catch implicit Valentine proofs via date if not in explicit mode but during season
-        is_valentine_season = (now.month == 2 and 11 <= now.day <= 14)
-        if is_valentine_season:
+        is_march_season = (now.month == 3)
+        if is_march_season:
              # If user sends media during season, treat as potential proof even if not explicitly in mode
              if has_proof_media(message):
-                 is_val_proof = True
+                 is_march_proof = True
 
             
-        if has_proof or is_val_proof:
+        if has_proof or is_march_proof:
             await state.clear()
             
         inbox = InboxMessage(
@@ -1641,9 +1711,9 @@ async def inbox(message: Message, state: FSMContext):
         user.last_activity_at = now
         await session.flush() # get ID
         
-        if is_val_proof:
-            caption = f"💘 Отчет 14 февраля:\n{text or '[Медиа]'}"
-            reply_markup = valentine_admin_keyboard(inbox.id)
+        if is_march_proof:
+            caption = f"🌸 Отчет (Март):\n{text or '[Медиа]'}"
+            reply_markup = march_admin_keyboard(inbox.id)
             if media_type == "photo":
                 await message.bot.send_photo(ADMIN_TG_ID, media_file_id, caption=caption, reply_markup=reply_markup)
             elif media_type == "video":
@@ -1657,12 +1727,12 @@ async def inbox(message: Message, state: FSMContext):
             else:
                 await message.bot.send_message(ADMIN_TG_ID, caption, reply_markup=reply_markup)
                 
-            await message.answer("Отчет отправлен купидону (админу)! Жди вердикт. 🏹")
+            await message.answer("Отчет отправлен на проверку! Жди вердикт. 🌸")
             await session.commit()
             return
 
         rules = []
-        if has_proof and not is_val_proof:
+        if has_proof and not is_march_proof:
             rules = await get_active_rules(session)
 
         await session.commit()
@@ -1936,8 +2006,8 @@ async def action_admin_callback(callback: CallbackQuery):
         return
 
 
-@router.callback_query(F.data.startswith("val_quest:"))
-async def val_quest_callback(callback: CallbackQuery):
+@router.callback_query(F.data.startswith("march_quest:"))
+async def march_quest_callback(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_TG_ID:
         return
         
@@ -1962,7 +2032,7 @@ async def val_quest_callback(callback: CallbackQuery):
             existing_approved = await session.scalar(
                 select(InboxMessage).where(
                     InboxMessage.user_id == user.id,
-                    InboxMessage.action_status == "approved_val",
+                    InboxMessage.action_status == "approved_march",
                     func.date(InboxMessage.created_at) == today,
                     InboxMessage.id != inbox_id # exclude self if re-clicking
                 )
@@ -1970,19 +2040,19 @@ async def val_quest_callback(callback: CallbackQuery):
             
             if existing_approved:
                 # Already paid for today, just mark this one as approved/duplicate
-                inbox.action_status = "approved_val_duplicate"
+                inbox.action_status = "approved_march_duplicate"
                 await session.commit()
                 await callback.answer("Уже было одобрено сегодня. Баллы не начислены повторно.")
                 await clear_inline_keyboard(callback.message)
                 await callback.message.answer(f"✅ Дубликат принят (без баллов).")
                 return
 
-            if inbox.action_status == "approved_val":
+            if inbox.action_status == "approved_march":
                  await callback.answer("Уже принято.")
                  return
 
             user.points = (user.points or 0) + 5
-            inbox.action_status = "approved_val"
+            inbox.action_status = "approved_march"
             await session.commit()
             
             await callback.answer("Принято! +5 баллов")
@@ -1991,10 +2061,10 @@ async def val_quest_callback(callback: CallbackQuery):
             
             await callback.message.bot.send_message(
                 user.tg_chat_id,
-                "💘 Твой отчет принят! Тебе начислено +5 баллов! Ты умничка! 😘"
+                "🌸 Твой отчет принят! Тебе начислено +5 баллов! Ты умничка! 😘"
             )
         elif action == "deny":
-            inbox.action_status = "denied_val"
+            inbox.action_status = "denied_march"
             await session.commit()
             
             await callback.answer("Отклонено")
