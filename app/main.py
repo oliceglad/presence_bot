@@ -30,7 +30,7 @@ from app.config import (
     REDIS_URL,
 )
 from app.handlers import router
-from app.scheduler import send_daily, send_outbox, send_reminders
+from app.scheduler import send_daily, send_outbox, send_reminders, send_future_messages
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +77,13 @@ async def main():
             send_outbox,
             "interval",
             seconds=10,
+            args=[bot]
+        )
+        scheduler.add_job(
+            send_future_messages,
+            "cron",
+            hour=SEND_HOUR,
+            minute=SEND_MINUTE,
             args=[bot]
         )
         scheduler.add_job(

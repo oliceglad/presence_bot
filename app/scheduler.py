@@ -10,7 +10,7 @@ from aiogram.exceptions import (
 )
 
 from app.db import AsyncSessionLocal
-from app.models import ScheduleMessage, User, Subscription
+from app.models import ScheduleMessage, User, Subscription, FutureMessage
 from app.config import (
     REMINDER_EXPIRES_IN_DAYS,
     REMINDER_INACTIVITY_DAYS,
@@ -91,7 +91,6 @@ async def send_daily(bot, session_factory=AsyncSessionLocal):
                 )
                 continue
 
-        # 4. Помечаем отправленным ТОЛЬКО если доставили хотя бы одному
         if delivered > 0:
             msg.sent_at = now_utc
             await session.commit()
@@ -105,6 +104,61 @@ async def send_daily(bot, session_factory=AsyncSessionLocal):
                 msg.id
             )
 
+async def send_future_messages(bot, session_factory=AsyncSessionLocal):
+    """
+    Отправляет письма в будущее (FutureMessage).
+    Запускается ежедневно (например, утром).
+    """
+    today_msk = datetime.now(MSK).date()
+    
+    async with session_factory() as session:
+        future_msgs = (await session.scalars(
+            select(FutureMessage)
+            .where(FutureMessage.sent == False)
+            .where(FutureMessage.send_date <= today_msk)
+            .order_by(FutureMessage.send_date)
+        )).all()
+
+        if not future_msgs:
+            logger.info("send_future_messages: no messages for today")
+            return
+
+        delivered = 0
+        for msg in future_msgs:
+            user = await session.get(User, msg.user_id)
+            if not user:
+                continue
+
+            try:
+                base_text = "🕰 Твое письмо из прошлого!\n\n"
+                text_to_send = f"{base_text}{msg.text}" if msg.text else base_text
+
+                if msg.media_type == "photo":
+                    await bot.send_photo(user.tg_chat_id, msg.media_file_id, caption=text_to_send)
+                elif msg.media_type == "video":
+                    await bot.send_video(user.tg_chat_id, msg.media_file_id, caption=text_to_send)
+                elif msg.media_type == "video_note":
+                    await bot.send_message(user.tg_chat_id, text_to_send)
+                    await bot.send_video_note(user.tg_chat_id, msg.media_file_id)
+                elif msg.media_type == "voice":
+                    await bot.send_voice(user.tg_chat_id, msg.media_file_id, caption=text_to_send)
+                elif msg.media_type == "document":
+                    await bot.send_document(user.tg_chat_id, msg.media_file_id, caption=text_to_send)
+                else:
+                    await bot.send_message(user.tg_chat_id, text_to_send)
+                
+                msg.sent = True
+                delivered += 1
+                logger.info("send_future_messages: delivered msg.id=%s to user.id=%s", msg.id, user.id)
+            except TelegramForbiddenError:
+                logger.warning("send_future_messages: user blocked bot user_id=%s", user.id)
+            except TelegramNetworkError as exc:
+                logger.warning("send_future_messages: network error msg=%s err=%s", msg.id, exc)
+            except Exception:
+                logger.exception("send_future_messages: unexpected error msg=%s", msg.id)
+        
+        await session.commit()
+        logger.info("send_future_messages: finished, delivered %s messages", delivered)
 
 async def send_outbox(
     bot,

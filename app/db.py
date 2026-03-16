@@ -10,6 +10,8 @@ ENGINE_KWARGS = {
 
 
 def make_engine():
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL is not set in environment or .env file")
     return create_async_engine(DATABASE_URL, **ENGINE_KWARGS)
 
 engine = make_engine()

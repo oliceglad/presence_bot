@@ -28,13 +28,11 @@ from app.models import (
     Subscription,
     ActionRule,
     ActionEvent,
-    Subscription,
-    ActionRule,
-    ActionEvent,
     ScheduleMessage,
     SupportMessage,
     Coupon,
     UserCoupon,
+    FutureMessage,
 )
 from app.config import (
     ADMIN_TG_ID,
@@ -64,6 +62,10 @@ class UserStates(StatesGroup):
     waiting_for_proof = State()
     waiting_for_march_proof = State()
 
+class FutureMessageStates(StatesGroup):
+    waiting_for_message = State()
+    waiting_for_date = State()
+
 TASKS = [
     "10 минут прогулки",
     "3 благодарности в дневнике",
@@ -90,7 +92,8 @@ def admin_reply_keyboard():
 def user_reply_keyboard():
     rows = [
         [KeyboardButton(text="📋 Меню"), KeyboardButton(text="📤 Отправить отчет")],
-        [KeyboardButton(text="💳 Подписка"), KeyboardButton(text="📖 Правила")],
+        [KeyboardButton(text="💳 Подписка"), KeyboardButton(text="🗂 Мои письма")],
+        [KeyboardButton(text="💌 Письмо в будущее"), KeyboardButton(text="📖 Правила")],
         [KeyboardButton(text="🛍 Магазин"), KeyboardButton(text="🎒 Мои купоны"), KeyboardButton(text="🆘 Поддержка")],
     ]
     
@@ -445,6 +448,176 @@ async def unsnooze(message: Message):
         await session.commit()
 
     await message.answer("Напоминания снова активны.")
+
+
+@router.message(F.text == "🗂 Мои письма")
+async def future_message_list(message: Message):
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(
+            select(User).where(User.tg_user_id == message.from_user.id)
+        )
+        if not user:
+            await message.answer("Пользователь не найден.")
+            return
+
+        future_msgs = (await session.scalars(
+            select(FutureMessage)
+            .where(FutureMessage.user_id == user.id)
+            .where(FutureMessage.sent == False)
+            .order_by(FutureMessage.send_date)
+        )).all()
+
+    if not future_msgs:
+        await message.answer("У тебя пока нет писем в будущее. Напиши первое! 💌")
+        return
+
+    for msg in future_msgs:
+        media_info = "📷 Медиа" if msg.media_type else "📝 Текст"
+        text_snippet = shorten_text(msg.text or "", 30)
+        content_desc = f"{media_info}: {text_snippet}" if msg.text else media_info
+
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Отправить сейчас", callback_data=f"future_send_early:{msg.id}")]
+        ])
+        await message.answer(
+            f"Письмо на {msg.send_date.strftime('%d.%m.%Y')}\n{content_desc}",
+            reply_markup=markup
+        )
+
+@router.callback_query(F.data.startswith("future_send_early:"))
+async def future_message_send_early(call: CallbackQuery):
+    msg_id = int(call.data.split(":")[1])
+
+    async with AsyncSessionLocal() as session:
+        future_msg = await session.get(FutureMessage, msg_id)
+        if not future_msg or future_msg.sent:
+            await call.answer("Письмо уже отправлено или не найдено.")
+            await call.message.delete()
+            return
+
+        # Fetch it immediately
+        user = await session.get(User, future_msg.user_id)
+        if not user or user.tg_user_id != call.from_user.id:
+            await call.answer("Нет прав.")
+            return
+
+        # Send to user
+        try:
+            if future_msg.media_type == "photo":
+                await call.message.bot.send_photo(call.message.chat.id, future_msg.media_file_id, caption=future_msg.text)
+            elif future_msg.media_type == "video":
+                await call.message.bot.send_video(call.message.chat.id, future_msg.media_file_id, caption=future_msg.text)
+            elif future_msg.media_type == "video_note":
+                await call.message.bot.send_video_note(call.message.chat.id, future_msg.media_file_id)
+            elif future_msg.media_type == "voice":
+                await call.message.bot.send_voice(call.message.chat.id, future_msg.media_file_id, caption=future_msg.text)
+            elif future_msg.media_type == "document":
+                await call.message.bot.send_document(call.message.chat.id, future_msg.media_file_id, caption=future_msg.text)
+            else:
+                await call.message.bot.send_message(call.message.chat.id, future_msg.text or "[без текста]")
+
+            future_msg.sent = True
+            await session.commit()
+            await call.message.edit_text(f"Письмо от {future_msg.created_at.strftime('%d.%m.%Y')} доставлено досрочно! 🕰 -> ✨")
+        except Exception as e:
+            logging.error(f"Error sending early future message: {e}")
+            await call.answer("Ошибка отправки.")
+
+# ==========================================
+# LETTER TO THE FUTURE
+# ==========================================
+
+@router.message(F.text == "💌 Письмо в будущее")
+async def future_message_start(message: Message, state: FSMContext):
+    await message.answer(
+        "Напиши сообщение, отправь фото, видео, кружок или голосовое, и выбери дату, "
+        "когда я тебе его пришлю! 🕰\n\n"
+        "Жду твое послание в будущее:"
+    )
+    await state.set_state(FutureMessageStates.waiting_for_message)
+
+
+@router.message(FutureMessageStates.waiting_for_message)
+async def future_message_received(message: Message, state: FSMContext):
+    media_type, media_file_id = extract_media(message)
+    text = extract_text(message)
+
+    if not media_type and not text:
+        await message.answer("Пожалуйста, отправь текст, фото, видео или голосовое сообщение.")
+        return
+
+    await state.update_data(
+        media_type=media_type,
+        media_file_id=media_file_id,
+        text=text
+    )
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Через 1 неделю", callback_data="future_date:week")],
+        [InlineKeyboardButton(text="Через 1 месяц", callback_data="future_date:month")],
+        [InlineKeyboardButton(text="Через 6 месяцев", callback_data="future_date:half_year")],
+        [InlineKeyboardButton(text="Через 1 год", callback_data="future_date:year")],
+        [InlineKeyboardButton(text="Через 5 лет", callback_data="future_date:five_years")],
+        [InlineKeyboardButton(text="Отмена", callback_data="future_date:cancel")]
+    ])
+
+    await message.answer(
+        "Сообщение сохранено! Теперь выбери, когда его отправить:",
+        reply_markup=markup
+    )
+    await state.set_state(FutureMessageStates.waiting_for_date)
+
+
+@router.callback_query(FutureMessageStates.waiting_for_date, F.data.startswith("future_date:"))
+async def future_message_date_selected(call: CallbackQuery, state: FSMContext):
+    action = call.data.split(":")[1]
+
+    if action == "cancel":
+        await call.message.edit_text("Запись письма в будущее отменена.")
+        await state.clear()
+        return
+
+    now = datetime.now()
+    if action == "week":
+        send_date = (now + timedelta(weeks=1)).date()
+    elif action == "month":
+        send_date = (now + timedelta(days=30)).date()
+    elif action == "half_year":
+        send_date = (now + timedelta(days=182)).date()
+    elif action == "year":
+        send_date = (now + timedelta(days=365)).date()
+    elif action == "five_years":
+        send_date = (now + timedelta(days=365*5)).date()
+    else:
+        await call.answer("Неизвестная дата.")
+        return
+
+    data = await state.get_data()
+    media_type = data.get("media_type")
+    media_file_id = data.get("media_file_id")
+    text = data.get("text")
+
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(
+            select(User).where(User.tg_user_id == call.from_user.id)
+        )
+        if not user:
+            await call.answer("Пользователь не найден.")
+            await state.clear()
+            return
+
+        future_msg = FutureMessage(
+            user_id=user.id,
+            media_type=media_type,
+            media_file_id=media_file_id,
+            text=text,
+            send_date=send_date
+        )
+        session.add(future_msg)
+        await session.commit()
+
+    await call.message.edit_text(f"Готово! Я доставлю это сообщение {send_date.strftime('%d.%m.%Y')}.")
+    await state.clear()
 
 async def send_random_to_users(bot, chat_id: int):
     if USE_CELERY:
@@ -1931,10 +2104,12 @@ async def action_admin_callback(callback: CallbackQuery):
 
         # Award points
         async with AsyncSessionLocal() as session:
-            user_model = await session.get(User, inbox.user_id)
-            if user_model:
-                user_model.points = (user_model.points or 0) + 10
-                await session.commit()
+            inbox_obj = await session.get(InboxMessage, inbox_id)
+            if inbox_obj:
+                user_model = await session.get(User, inbox_obj.user_id)
+                if user_model:
+                    user_model.points = (user_model.points or 0) + 10
+                    await session.commit()
 
         await clear_inline_keyboard(callback.message)
         await callback.answer("Продлено +10 баллов.")

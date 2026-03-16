@@ -112,3 +112,17 @@ class UserCoupon(Base):
     status = Column(String, default="active") # active, used
     created_at = Column(DateTime, server_default=func.now())
     redeemed_at = Column(DateTime, nullable=True)
+
+
+class FutureMessage(Base):
+    __tablename__ = "future_messages"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    media_type = Column(String, nullable=True) # photo, video, voice, text, document, video_note
+    media_file_id = Column(String, nullable=True)
+    text = Column(Text, nullable=True)
+    send_date = Column(Date, nullable=False)
+    sent = Column(Boolean, default=False)
+    created_at = Column(DateTime, server_default=func.now())
+
